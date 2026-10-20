@@ -1,0 +1,95 @@
+---
+name: Release
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and verify without publishing
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, attest, and publish
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build development image
+        run: >-
+          sudo podman build --pull=always
+          --tag localhost/ioplane/tidyshare-dev:1.27.3
+          --file Containerfile .
+
+      - name: Verify tree
+        run: |
+          sudo podman compose run --rm modcheck
+          sudo podman compose run --rm fmtcheck
+          sudo podman compose run --rm vet
+          sudo podman compose run --rm race
+
+      - name: Build release binaries
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'snapshot' }}
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/release
+          for arch in amd64 arm64; do
+            sudo podman run --rm \
+              --security-opt no-new-privileges=true \
+              --volume "$PWD:/workspace:rw" \
+              --workdir /workspace \
+              --env CGO_ENABLED=0 --env GOOS=linux --env GOARCH="$arch" \
+              --env HOME=/tmp/home --env GOCACHE=/tmp/go-build \
+              localhost/ioplane/tidyshare-dev:1.27.3 \
+              go build -trimpath \
+                -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${GITHUB_SHA}" \
+                -o ".artifacts/release/tidyshare_${VERSION}_linux_${arch}" ./cmd/tidyshare
+          done
+          sudo chown -R "$(id -u):$(id -g)" .artifacts
+          (cd .artifacts/release && sha256sum tidyshare_* > tidyshare_${VERSION}_checksums.txt)
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: .artifacts/release/tidyshare_*
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ github.sha }}
+          path: .artifacts/release/
+          retention-days: 14
+
+      - name: Publish GitHub release
+        if: ${{ github.ref_type == 'tag' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: >-
+          gh release create "$TAG" .artifacts/release/*
+          --title "$TAG" --generate-notes --verify-tag

@@ -1,0 +1,72 @@
+---
+name: CI
+
+# yamllint disable-line rule:truthy
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  required:
+    name: required
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
+        with:
+          egress-policy: audit
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Report Podman runtime
+        run: sudo podman version
+
+      - name: Build development image
+        run: >-
+          sudo podman build --pull=always
+          --tag localhost/ioplane/tidyshare-dev:1.27.3
+          --file Containerfile .
+
+      - name: Validate Compose model
+        run: sudo podman compose config --quiet
+
+      - name: Verify module files
+        run: sudo podman compose run --rm modcheck
+
+      - name: Verify formatting
+        run: sudo podman compose run --rm fmtcheck
+
+      - name: Vet
+        run: sudo podman compose run --rm vet
+
+      - name: Lint
+        run: sudo podman compose run --rm lint
+
+      - name: Test
+        run: sudo podman compose run --rm test
+
+      - name: Test with race detector
+        run: sudo podman compose run --rm race
+
+      - name: Check known vulnerabilities
+        run: sudo podman compose run --rm vuln
+
+      - name: Build
+        run: sudo podman compose run --rm build
