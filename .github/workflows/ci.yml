@@ -38,6 +38,9 @@ jobs:
       - name: Report Podman runtime
         run: sudo podman version
 
+      - name: Start Podman API socket
+        run: sudo systemctl enable --now podman.socket
+
       - name: Build development image
         run: >-
           sudo podman build --pull=always
