@@ -1,0 +1,46 @@
+---
+version: "2"
+
+run:
+  timeout: 10m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosec
+    - misspell
+    - bodyclose
+    - errorlint
+    - copyloopvar
+  settings:
+    staticcheck:
+      checks:
+        - all
+        - -ST1000
+  exclusions:
+    generated: strict
+    presets:
+      - std-error-handling
+    rules:
+      - path: '(.+)_test\.go'
+        linters:
+          - gosec
+      # The tool reads and moves arbitrary operator-supplied paths by design.
+      - linters:
+          - gosec
+        text: "G304|G301|G302|G306|G204|G115|G703|G705"
+
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    gofumpt:
+      module-path: github.com/ioplane/tidyshare

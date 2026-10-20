@@ -1,0 +1,75 @@
+---
+name: tidyshare
+
+x-verification-service: &verification-service
+  image: localhost/ioplane/tidyshare-dev:1.27.3
+  working_dir: /workspace
+  read_only: true
+  network_mode: none
+  security_opt:
+    - no-new-privileges=true
+  environment:
+    CGO_ENABLED: "0"
+    HOME: /tmp/home
+    XDG_CACHE_HOME: /tmp/cache
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=2g
+  volumes:
+    - .:/workspace:ro
+
+services:
+  format:
+    <<: *verification-service
+    volumes:
+      - .:/workspace:rw
+    command: ["gofumpt", "-w", "."]
+
+  fmtcheck:
+    <<: *verification-service
+    command: ["sh", "-c", "test -z \"$(gofumpt -l .)\""]
+
+  modcheck:
+    <<: *verification-service
+    network_mode: bridge
+    environment:
+      CGO_ENABLED: "0"
+      HOME: /tmp/home
+      XDG_CACHE_HOME: /tmp/cache
+      GOMODCACHE: /tmp/gomod
+      GOPROXY: https://proxy.golang.org
+    command: ["go", "mod", "tidy", "-diff"]
+
+  vet:
+    <<: *verification-service
+    command: ["go", "vet", "./..."]
+
+  lint:
+    <<: *verification-service
+    command: ["golangci-lint", "run", "--config", ".config/golangci.yml"]
+
+  test:
+    <<: *verification-service
+    command: ["go", "test", "-count=1", "-shuffle=on", "./..."]
+
+  race:
+    <<: *verification-service
+    environment:
+      CGO_ENABLED: "1"
+      HOME: /tmp/home
+      XDG_CACHE_HOME: /tmp/cache
+    command: ["go", "test", "-race", "-count=1", "-shuffle=on", "-covermode=atomic", "./..."]
+
+  vuln:
+    <<: *verification-service
+    network_mode: bridge
+    command: ["govulncheck", "./..."]
+
+  build:
+    <<: *verification-service
+    command:
+      - go
+      - build
+      - -trimpath
+      - -o
+      - /tmp/tidyshare
+      - ./cmd/tidyshare
