@@ -1,0 +1,65 @@
+---
+name: Bug report
+description: Report reproducible incorrect or unsafe behavior.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not include real file listings, credentials or host identifiers.
+        Report vulnerabilities privately.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of tidyshare version.
+    validations:
+      required: true
+  - type: dropdown
+    id: command
+    attributes:
+      label: Command
+      options:
+        - scan
+        - apply (dry run)
+        - apply -mode quarantine
+        - apply -mode dedupe
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, kernel, and filesystem type of the tree.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal steps on a disposable directory.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and error output
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Confirmation
+      options:
+        - label: I removed private paths and host identifiers.
+          required: true
+        - label: This report is not an undisclosed vulnerability.
+          required: true
