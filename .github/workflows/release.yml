@@ -39,6 +39,9 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Start Podman API socket
+        run: sudo systemctl enable --now podman.socket
+
       - name: Build development image
         run: >-
           sudo podman build --pull=always
