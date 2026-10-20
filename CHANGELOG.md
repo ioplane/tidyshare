@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   free of writes, and refuse quarantine destination replacement.
 - Normalize scan roots to absolute paths and reject invalid roots or
   numeric bounds before creating report files.
+- Keep directory summary names relative when scanning the filesystem root.
 
 ### Added
 

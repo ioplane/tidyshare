@@ -585,7 +585,11 @@ func writeSummary(es []entry, o opts, ng, nd int, reclaim int64, ns int, staleBy
 		get(cats, e.Cat).add(e)
 		get(areas, e.Area).add(e)
 		get(mimes, e.Mime).add(e)
-		parts := strings.Split(strings.TrimPrefix(e.Path, o.root+"/"), "/")
+		rel, err := filepath.Rel(o.root, e.Path)
+		if err != nil {
+			return fmt.Errorf("relative report path: %w", err)
+		}
+		parts := strings.Split(rel, string(filepath.Separator))
 		for d := 1; d < len(parts) && d <= o.depth; d++ {
 			get(dirs, strings.Join(parts[:d], "/")).add(e)
 		}

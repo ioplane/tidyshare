@@ -68,3 +68,18 @@ func TestScanRejectsInvalidRootBeforeWrites(t *testing.T) {
 		}
 	}
 }
+
+func TestFilesystemRootDirectorySummary(t *testing.T) {
+	o := opts{root: "/", out: t.TempDir(), depth: 2, minSize: 1, staleDays: 365}
+	es := []entry{{Path: "/fixture/nested/file.zip", Area: "fixture", Size: 10, Cat: "archive", Mime: "application/zip", Mtime: time.Now().Unix()}}
+	if err := writeSummary(es, o, 0, 0, 0, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(o.out, "report.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "| fixture/nested |") || strings.Contains(string(b), "|  |") {
+		t.Fatalf("invalid filesystem-root directories: %s", b)
+	}
+}
