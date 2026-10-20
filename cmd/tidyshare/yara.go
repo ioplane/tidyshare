@@ -16,9 +16,7 @@ type yaraHit struct {
 	Size       int64
 }
 
-// runYara scans only the selected categories with the classic `yara` CLI
-// (--scan-list). ponytail: YARA-X's `yr scan` documents no scan-list option,
-// so yr is not driven here; add a per-directory mode if it is needed.
+// runYara scans selected categories with the configured classic yara CLI.
 func runYara(es []entry, o opts) ([]yaraHit, error) {
 	if o.yaraRules == "" {
 		return nil, nil

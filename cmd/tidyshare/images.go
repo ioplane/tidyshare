@@ -14,10 +14,12 @@ import (
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -39,9 +41,10 @@ type imgArchive struct {
 }
 
 type imageReport struct {
-	Local    []localImage
-	Archives []imgArchive
-	SystemDF map[string]string
+	Local       []localImage
+	Archives    []imgArchive
+	SystemDF    map[string]string
+	Unavailable map[string]string
 }
 
 // first tar entry of anything `podman|docker save` writes
@@ -51,11 +54,17 @@ var (
 )
 
 func scanImages(es []entry, o opts) imageReport {
-	r := imageReport{SystemDF: map[string]string{}}
+	r := imageReport{SystemDF: map[string]string{}, Unavailable: map[string]string{}}
 	owners := append([]string{"root"}, splitList(o.imageUsers)...)
+	seen := map[string]bool{}
 	for _, ow := range owners {
+		if seen[ow] {
+			continue
+		}
+		seen[ow] = true
 		imgs, df, err := listLocal(o.engine, ow)
 		if err != nil {
+			r.Unavailable[ow] = err.Error()
 			fmt.Fprintf(os.Stderr, "warn: %s images (%s): %v\n", o.engine, ow, err)
 			continue
 		}
@@ -116,6 +125,8 @@ func scanImages(es []entry, o opts) imageReport {
 			a.Status = "in-store"
 		case found > 0:
 			a.Status = "partial"
+		case len(r.Unavailable) > 0:
+			a.Status = "unknown"
 		default:
 			a.Status = "absent"
 		}
@@ -141,6 +152,9 @@ func splitList(s string) []string {
 // Only podman's JSON shape is parsed; a `docker` binary works only when it is
 // a podman shim.
 func listLocal(engine, owner string) ([]localImage, string, error) {
+	if owner == "root" && os.Geteuid() != 0 {
+		return nil, "", errors.New("root store requires root privileges")
+	}
 	run := func(args ...string) ([]byte, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
@@ -152,9 +166,13 @@ func listLocal(engine, owner string) ([]localImage, string, error) {
 			if err != nil {
 				return nil, err
 			}
+			runtimeDir := filepath.Join("/run/user", u.Uid)
+			if err := validateRuntimeDir(runtimeDir, u.Uid); err != nil {
+				return nil, err
+			}
 			c = exec.CommandContext(ctx, "runuser", append([]string{
 				"-u", owner, "--", "env",
-				"HOME=" + u.HomeDir, "XDG_RUNTIME_DIR=/run/user/" + u.Uid, engine,
+				"HOME=" + u.HomeDir, "XDG_RUNTIME_DIR=" + runtimeDir, engine,
 			}, args...)...)
 			c.Dir = "/" // the caller's cwd may be unreadable for the target user
 		}
@@ -172,23 +190,51 @@ func listLocal(engine, owner string) ([]localImage, string, error) {
 	var raw []struct {
 		ID         string   `json:"Id"`
 		RepoTags   []string `json:"RepoTags"`
+		Names      []string
 		Size       int64
 		Created    int64
 		Dangling   bool
-		Containers int
+		Containers *int
 	}
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return nil, "", err
 	}
 	var imgs []localImage
 	for _, x := range raw {
+		var tags []string
+		for _, names := range [][]string{x.Names, x.RepoTags} {
+			tags = slices.DeleteFunc(names, func(s string) bool { return s == "" || s == "<none>" || s == "<none>:<none>" })
+			if len(tags) > 0 {
+				break
+			}
+		}
+		containers := -1
+		if x.Containers != nil {
+			containers = *x.Containers
+		}
 		imgs = append(imgs, localImage{
 			ID: strings.TrimPrefix(x.ID, "sha256:"), Owner: owner,
-			Tags: x.RepoTags, Size: x.Size, Created: x.Created, Dangling: x.Dangling, Containers: x.Containers,
+			Tags: tags, Size: x.Size, Created: x.Created, Dangling: x.Dangling, Containers: containers,
 		})
 	}
 	df, _ := run("system", "df")
 	return imgs, string(df), nil
+}
+
+// A dormant store must not be started with an invented runtime directory.
+func validateRuntimeDir(path, uid string) error {
+	st, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("rootless runtime unavailable: %w", err)
+	}
+	owner, err := strconv.ParseUint(uid, 10, 32)
+	if err != nil {
+		return fmt.Errorf("invalid runtime owner: %w", err)
+	}
+	if !st.IsDir() || st.Mode().Perm()&0o077 != 0 || uint64(st.Sys().(*syscall.Stat_t).Uid) != owner {
+		return errors.New("rootless runtime must be a private directory owned by the requested user")
+	}
+	return nil
 }
 
 // readArchive reads manifest.json / index.json from a docker-archive or
@@ -302,6 +348,14 @@ func writeImages(r imageReport, o opts) error {
 	}
 	w := bufio.NewWriter(f)
 	fmt.Fprintln(w, "kind\tstatus\tsize\tids\ttags\tstores\tpath")
+	owners := make([]string, 0, len(r.Unavailable))
+	for owner := range r.Unavailable {
+		owners = append(owners, owner)
+	}
+	slices.Sort(owners)
+	for _, owner := range owners {
+		fmt.Fprintf(w, "store\tunavailable\t0\t\t\t%s\t\n", strconv.Quote(owner))
+	}
 	for _, a := range r.Archives {
 		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\t%s\n", a.Format, a.Status, a.Size,
 			strings.Join(shorts(a.IDs), ","), strings.Join(a.Tags, ","), strings.Join(a.Stores, ","), strconv.Quote(a.Path))
@@ -320,6 +374,8 @@ func writeImages(r imageReport, o opts) error {
 		kind := "local"
 		if l.Dangling {
 			kind = "local-dangling"
+		} else if len(l.Tags) == 0 {
+			kind = "local-untagged"
 		}
 		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\t\n", kind, st, l.Size, short(l.ID), strings.Join(l.Tags, ","), l.Owner)
 	}
@@ -336,20 +392,32 @@ func writeImages(r imageReport, o opts) error {
 	}
 	defer md.Close()
 	var dang, unused int64
-	var nd, nu int
+	var nd, nu, untagged int
 	for _, l := range r.Local {
+		if len(l.Tags) == 0 {
+			untagged++
+		}
 		switch {
 		case l.Dangling:
 			dang += l.Size
 			nd++
-		case l.Containers == 0:
+		case l.Containers == 0 && len(l.Tags) > 0:
 			unused += l.Size
 			nu++
 		}
 	}
-	fmt.Fprintf(md, "# Container images\n\n- local images: %d, dangling: %d (%s), tagged without containers: %d (%s; sizes include shared layers)\n- image archives on the share: %d\n\n",
-		len(r.Local), nd, gib(dang), nu, gib(unused), len(r.Archives))
-	for ow, df := range r.SystemDF {
+	fmt.Fprintf(md, "# Container images\n\n- local images: %d, dangling: %d (%s), tagged without containers: %d (%s; sizes include shared layers), untagged: %d\n- image archives on the share: %d\n\n",
+		len(r.Local), nd, gib(dang), nu, gib(unused), untagged, len(r.Archives))
+	for _, owner := range owners {
+		fmt.Fprintf(md, "- store %q unavailable: %s\n", owner, r.Unavailable[owner])
+	}
+	owners = owners[:0]
+	for owner := range r.SystemDF {
+		owners = append(owners, owner)
+	}
+	slices.Sort(owners)
+	for _, ow := range owners {
+		df := r.SystemDF[ow]
 		fmt.Fprintf(md, "## `%s system df` (%s)\n\n```text\n%s```\n\n", o.engine, ow, df)
 	}
 	fmt.Fprint(md, "## Image archives vs local storage\n\n| status | size | ids | tags | stores | path |\n|:---|---:|:---|:---|:---|:---|\n")

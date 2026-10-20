@@ -47,3 +47,9 @@ tidyshare <command> [flags]
 | 0 | completed |
 | 1 | error (bad flags, unreadable plan, report write failure) |
 | 2 | unknown command |
+
+`scan` accepts a real directory as `-root` and normalizes it to an absolute
+path so duplicate plans can be applied from another directory. A missing
+root, a regular file or a root symlink is rejected before reports are
+created. `-workers` and `-min-size` must be positive; `-settle`, `-stale-days`
+and `-depth` must be non-negative.

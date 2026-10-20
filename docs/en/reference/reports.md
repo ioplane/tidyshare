@@ -38,3 +38,19 @@ Paths in TSV files are Go-quoted strings.
 | --- | --- |
 | `junk` | name ends with `~`, is `core.<pid>`, starts with `.~lock`, or has a `.tmp`, `.part`, `.crdownload`, `.swp`, `.bak`, `.old`, `.orig` extension |
 | `cold` | mtime older than `-stale-days`; `atime` is recorded but not used, because a backup or hash pass resets it |
+
+## Image inventory
+
+`images.tsv` keeps the columns `kind`, `status`, `size`, `ids`, `tags`,
+`stores`, `path`. Unnamed non-dangling images use `local-untagged`.
+A `store` row with status `unavailable` identifies a failed requested store
+in the Go-quoted `stores` column; its diagnostic is in `images.md`.
+Archive status `unknown` means no ID was found while at least one requested
+store was unavailable. `absent` requires all requested stores to be queried
+successfully. Only a complete positive `in-store` match qualifies for tier 2
+review; neither status authorizes deletion.
+
+Duplicate totals are logical file lengths, not a measurement of unique
+allocated extents. Already shared extents, hardlinks and sparse files can
+reduce the actual recovery. Measure filesystem free space before and after
+an approved operation and compare file content and metadata.
