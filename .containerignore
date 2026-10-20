@@ -8,3 +8,23 @@ tidyshare-report/
 *.out
 *.test
 .DS_Store
+
+# Local task tracking and assistant metadata
+.beads/
+.beads.*
+.beads-credential-key
+.dolt/
+.agents/
+.claude/
+.codex/
+.cursor/
+.gemini/
+.serena/
+.opencode/
+.aider*
+.mcp.json
+AGENTS.md
+AGENTS.local.md
+CLAUDE.md
+CLAUDE.local.md
+GEMINI.md
