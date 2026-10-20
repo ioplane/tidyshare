@@ -16,7 +16,9 @@ flowchart LR
     plan -. reviewed .-> apply[apply]
 ```
 
-`scan` reads. Only `apply` writes, and only to files named in a plan.
+`scan` reads input files and writes reports under `-out`; that directory is
+excluded from the walk. `apply` changes files from a reviewed plan and writes
+its operation manifest under `-quarantine`.
 
 ## Duplicate detection
 
@@ -40,6 +42,9 @@ modified within `-settle` are never candidates.
 
 `dedupe` uses `FIDEDUPERANGE`. Deleting one of two extent-sharing files frees
 no space until the other is gone as well.
+Replacing two independently allocated identical extents with one shared
+extent can free space immediately. Logical duplicate totals do not measure
+that gain; already shared extents and sparse files can reduce it to zero.
 
 ## Tiers
 
@@ -53,4 +58,8 @@ garbage: tier 3 lists it for visibility only.
 - The walk is single-threaded; hashing and MIME detection run in parallel.
 - MIME uses the first 3 KiB of a file.
 - Image matching compares image IDs; layers are not compared across images.
+- Failed requested image stores are explicitly unavailable; they cannot
+  establish that an unmatched archive is absent.
+- Apply requires reviewed, quiet files and parent directories; a scan is not
+  a filesystem snapshot or a lock against concurrent writers.
 - Windows and macOS are not supported.

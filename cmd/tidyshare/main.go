@@ -116,7 +116,7 @@ func main() {
 
 func runScan(args []string) int {
 	var o opts
-	fs := flag.NewFlagSet("scan", flag.ExitOnError)
+	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	skip := fs.String("skip", "", "comma-separated absolute dirs to skip")
 	fs.StringVar(&o.root, "root", "", "tree to scan (required)")
 	fs.StringVar(&o.out, "out", "tidyshare-report", "report directory; keep it off a nearly full share")
@@ -132,11 +132,30 @@ func runScan(args []string) int {
 	fs.StringVar(&o.yaraBin, "yara-bin", "yara", "classic yara CLI (needs --scan-list)")
 	fs.StringVar(&o.yaraCats, "yara-cats", "binary,installer,package,firmware,dump", "categories to scan with YARA")
 	fs.Int64Var(&o.yaraMax, "yara-max-size", 512<<20, "skip larger files in the YARA scan")
-	_ = fs.Parse(args) // flag.ExitOnError exits on a parse error
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return fail(err)
+	}
 	if o.root == "" {
 		return fail(errors.New("-root is required"))
 	}
-	o.root = filepath.Clean(o.root)
+	if o.workers <= 0 || o.minSize <= 0 || o.settle < 0 || o.staleDays < 0 || o.depth < 0 || fs.NArg() != 0 {
+		return fail(errors.New("workers and min-size must be positive; settle, stale-days and depth must be non-negative; no positional arguments"))
+	}
+	root, err := filepath.Abs(o.root)
+	if err != nil {
+		return fail(err)
+	}
+	st, err := os.Lstat(root)
+	if err != nil {
+		return fail(err)
+	}
+	if !st.IsDir() {
+		return fail(errors.New("root must be a directory, not a file or symlink"))
+	}
+	o.root = root
 	o.skip = map[string]bool{}
 	for _, s := range strings.Split(*skip, ",") {
 		if s != "" {
@@ -181,8 +200,7 @@ func fail(err error) int {
 	return 1
 }
 
-// walk is single-threaded: lstat of ~1.5M inodes is bounded by the page cache,
-// not by CPU. ponytail: parallelise per top-level dir if a scan exceeds ~10 min.
+// shortcut: walk serially until scans exceed ten minutes
 func walk(o opts) ([]entry, error) {
 	cutoff := time.Now().AddDate(0, 0, -o.staleDays).Unix()
 	var es []entry
@@ -579,7 +597,7 @@ func writeSummary(es []entry, o opts, ng, nd int, reclaim int64, ns int, staleBy
 	defer f.Close()
 	w := bufio.NewWriter(f)
 	defer w.Flush()
-	fmt.Fprintf(w, "# %s report, %s\n\n- files: %d, bytes: %s\n- duplicate groups: %d, redundant files: %d, reclaimable: %s (min-size %s)\n- stale files (junk, or mtime older than %d d): %d, %s\n\n",
+	fmt.Fprintf(w, "# %s report, %s\n\n- files: %d, bytes: %s\n- duplicate groups: %d, redundant files: %d, logical duplicate bytes: %s (min-size %s)\n- stale files (junk, or mtime older than %d d): %d, %s\n\n",
 		o.root, time.Now().Format("2006-01-02"), len(es), gib(total), ng, nd, gib(reclaim),
 		strconv.FormatInt(o.minSize>>20, 10)+" MiB", o.staleDays, ns, gib(staleBytes))
 	table := func(title string, m map[string]*agg, n int) {
@@ -621,70 +639,181 @@ type row struct {
 	size, mt  int64
 }
 
+// readPlan validates every row before apply can create directories or move files.
+func readPlan(f *os.File) (map[string][]row, []string, error) {
+	groups := map[string][]row{}
+	var order []string
+	seen := map[string]bool{}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 1<<20), 1<<20)
+	sc.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+		if atEOF && len(data) > 0 && data[len(data)-1] != '\n' {
+			return 0, nil, errors.New("truncated plan: missing final newline")
+		}
+		return bufio.ScanLines(data, atEOF)
+	})
+	if !sc.Scan() || sc.Text() != "group\taction\tsize\tmtime\tpath" {
+		return nil, nil, errors.New("invalid plan header")
+	}
+	for line := 2; sc.Scan(); line++ {
+		c := strings.Split(sc.Text(), "\t")
+		if len(c) != 5 {
+			return nil, nil, fmt.Errorf("invalid plan row %d: expected five columns", line)
+		}
+		id, idErr := strconv.ParseUint(c[0], 10, 64)
+		sz, szErr := strconv.ParseInt(c[2], 10, 64)
+		mt, mtErr := strconv.ParseInt(c[3], 10, 64)
+		path, pathErr := strconv.Unquote(c[4])
+		if idErr != nil || id == 0 || strconv.FormatUint(id, 10) != c[0] ||
+			(c[1] != "keep" && c[1] != "dup") || szErr != nil || sz <= 0 || mtErr != nil ||
+			pathErr != nil || !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" || strings.ContainsRune(path, 0) || seen[path] {
+			return nil, nil, fmt.Errorf("invalid or repeated plan row %d", line)
+		}
+		seen[path] = true
+		if _, ok := groups[c[0]]; !ok {
+			order = append(order, c[0])
+		}
+		groups[c[0]] = append(groups[c[0]], row{c[1], path, sz, mt})
+	}
+	if err := sc.Err(); err != nil {
+		return nil, nil, fmt.Errorf("read plan: %w", err)
+	}
+	for id, rows := range groups {
+		keepers := 0
+		for _, r := range rows {
+			if r.act == "keep" {
+				keepers++
+			}
+			if r.size != rows[0].size {
+				return nil, nil, fmt.Errorf("plan group %s has different sizes", id)
+			}
+		}
+		if keepers != 1 || len(rows) < 2 {
+			return nil, nil, fmt.Errorf("plan group %s needs one keeper and at least one duplicate", id)
+		}
+	}
+	return groups, order, nil
+}
+
+// plainPath rejects symlinks in every component. For a missing path it returns
+// the nearest existing ancestor so dry runs can check the filesystem without writes.
+func plainPath(path string, allowMissing bool) (os.FileInfo, error) {
+	var nearest os.FileInfo
+	for cur := path; ; cur = filepath.Dir(cur) {
+		st, err := os.Lstat(cur)
+		if err != nil {
+			if !allowMissing || !os.IsNotExist(err) {
+				return nil, err
+			}
+		} else {
+			if st.Mode()&os.ModeSymlink != 0 || (cur != path && !st.IsDir()) {
+				return nil, fmt.Errorf("unsafe path component %s", cur)
+			}
+			if nearest == nil {
+				nearest = st
+			}
+		}
+		if cur == "/" {
+			return nearest, nil
+		}
+	}
+}
+
 func runApply(args []string) int {
-	fs := flag.NewFlagSet("apply", flag.ExitOnError)
+	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
 	plan := fs.String("plan", "", "dups.tsv from scan")
 	mode := fs.String("mode", "quarantine", "quarantine: move dups aside; dedupe: share extents with the keeper (XFS reflink), paths stay")
 	q := fs.String("quarantine", "", "quarantine dir on the SAME filesystem as the files (mode quarantine; manifest dir for dedupe)")
 	limit := fs.Int("limit", 0, "stop after N files (canary run), 0 = all")
 	yes := fs.Bool("yes", false, "perform the changes (default: dry run)")
-	_ = fs.Parse(args) // flag.ExitOnError exits on a parse error
-	if *plan == "" || *q == "" || (*mode != "quarantine" && *mode != "dedupe") {
-		return fail(errors.New("-plan and -quarantine are required, -mode is quarantine|dedupe"))
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return fail(err)
+	}
+	if *plan == "" || *q == "" || (*mode != "quarantine" && *mode != "dedupe") || *limit < 0 || fs.NArg() != 0 {
+		return fail(errors.New("-plan and -quarantine are required, -mode is quarantine|dedupe, -limit must be non-negative; no positional arguments"))
 	}
 	f, err := os.Open(*plan)
 	if err != nil {
 		return fail(err)
 	}
 	defer f.Close()
-	if err := os.MkdirAll(*q, 0o755); err != nil {
-		return fail(err)
-	}
-	qst, _ := os.Stat(*q)
-	man, err := os.OpenFile(filepath.Join(*q, "MANIFEST.tsv"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	groups, order, err := readPlan(f)
 	if err != nil {
 		return fail(err)
 	}
-	defer man.Close()
-
-	groups := map[string][]row{}
-	var order []string
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
-	sc.Scan() // header
-	for sc.Scan() {
-		c := strings.Split(sc.Text(), "\t")
-		if len(c) != 5 {
-			continue
+	*q, err = filepath.Abs(*q)
+	if err != nil {
+		return fail(err)
+	}
+	qst, err := plainPath(*q, true)
+	if err != nil {
+		return fail(err)
+	}
+	if !qst.IsDir() {
+		return fail(errors.New("quarantine must be a directory"))
+	}
+	for _, rows := range groups {
+		for _, r := range rows {
+			if r.path == *q || strings.HasPrefix(r.path, strings.TrimSuffix(*q, "/")+"/") {
+				return fail(errors.New("plan source is inside quarantine"))
+			}
 		}
-		p, err := strconv.Unquote(c[4])
+	}
+	var man *os.File
+	if *yes {
+		if err := os.MkdirAll(*q, 0o755); err != nil {
+			return fail(err)
+		}
+		qst, err = plainPath(*q, false)
 		if err != nil {
-			continue
+			return fail(err)
 		}
-		sz, _ := strconv.ParseInt(c[2], 10, 64)
-		mt, _ := strconv.ParseInt(c[3], 10, 64)
-		if _, ok := groups[c[0]]; !ok {
-			order = append(order, c[0])
+		manifest := filepath.Join(*q, "MANIFEST.tsv")
+		if st, err := os.Lstat(manifest); err == nil && !st.Mode().IsRegular() {
+			return fail(errors.New("manifest must be a regular file"))
+		} else if err != nil && !os.IsNotExist(err) {
+			return fail(err)
 		}
-		groups[c[0]] = append(groups[c[0]], row{c[1], p, sz, mt})
+		man, err = os.OpenFile(manifest, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0o644)
+		if err != nil {
+			return fail(err)
+		}
+		defer man.Close()
+		st, err := man.Stat()
+		if err != nil {
+			return fail(err)
+		}
+		if !st.Mode().IsRegular() || st.Sys().(*syscall.Stat_t).Nlink != 1 {
+			return fail(errors.New("manifest must be a regular file with one link"))
+		}
+		planInfo, err := f.Stat()
+		if err != nil {
+			return fail(err)
+		}
+		if os.SameFile(st, planInfo) {
+			return fail(errors.New("manifest must not be the plan"))
+		}
 	}
 	var moved, skipped int
 	var bytes int64
 	free := func() uint64 {
 		var st syscall.Statfs_t
-		_ = syscall.Statfs(*q, &st)
+		_ = syscall.Statfs(qstPath(*q), &st)
 		return st.Bavail * uint64(st.Bsize)
 	}
 	freeBefore := free()
 	for _, id := range order {
-		var keeper *row
-		for i, r := range groups[id] {
+		var keeper row
+		for _, r := range groups[id] {
 			if r.act == "keep" {
-				keeper = &groups[id][i]
+				keeper = r
 			}
 		}
-		if keeper == nil || !unchanged(*keeper) {
-			skipped += len(groups[id])
+		if !unchanged(keeper) {
+			skipped += len(groups[id]) - 1
 			continue
 		}
 		for _, r := range groups[id] {
@@ -694,40 +823,56 @@ func runApply(args []string) int {
 			if *limit > 0 && moved >= *limit {
 				break
 			}
-			if !unchanged(r) || !sameDev(r.path, qst) || !sameDev(keeper.path, qst) {
+			if !unchanged(keeper) || !unchanged(r) || !sameDev(r.path, qst) || !sameDev(keeper.path, qst) {
 				skipped++
 				continue
 			}
-			if *mode == "dedupe" {
-				if !*yes {
-					fmt.Printf("DRY dedupe %s <- %s\n", r.path, keeper.path)
-				} else if err := dedupe(keeper.path, r.path, r.size); err != nil {
-					fmt.Fprintf(os.Stderr, "warn: dedupe %s: %v\n", r.path, err)
-					skipped++
-					continue
-				} else {
-					fmt.Fprintf(man, "%s\tdedupe\t%s\t%s\n", id, strconv.Quote(r.path), strconv.Quote(keeper.path))
-				}
-				moved++
-				bytes += r.size
-				continue
-			}
 			dst := filepath.Join(*q, r.path)
-			if !*yes {
-				fmt.Printf("DRY %s -> %s\n", r.path, dst)
-			} else {
-				if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			if *mode == "quarantine" {
+				if _, err := plainPath(dst, true); err != nil {
 					return fail(err)
 				}
-				if err := os.Rename(r.path, dst); err != nil {
-					fmt.Fprintln(os.Stderr, "warn:", err)
+				if _, err := os.Lstat(dst); !os.IsNotExist(err) {
+					fmt.Fprintf(os.Stderr, "warn: destination unavailable %s: %v\n", dst, err)
 					skipped++
 					continue
 				}
-				fmt.Fprintf(man, "%s\t%s\t%s\n", id, strconv.Quote(r.path), strconv.Quote(dst))
+			}
+			if !*yes {
+				fmt.Printf("DRY %s %s <- %s\n", *mode, r.path, keeper.path)
+			} else {
+				if *mode == "dedupe" {
+					err = dedupe(keeper.path, r.path, r.size)
+				} else {
+					if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+						return fail(err)
+					}
+					err = unix.Renameat2(unix.AT_FDCWD, r.path, unix.AT_FDCWD, dst, unix.RENAME_NOREPLACE)
+				}
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "warn: %s %s: %v\n", *mode, r.path, err)
+					skipped++
+					continue
+				}
+				if *mode == "dedupe" {
+					_, err = fmt.Fprintf(man, "%s\tdedupe\t%s\t%s\n", id, strconv.Quote(r.path), strconv.Quote(keeper.path))
+				} else {
+					_, err = fmt.Fprintf(man, "%s\t%s\t%s\n", id, strconv.Quote(r.path), strconv.Quote(dst))
+				}
+				if err != nil {
+					return fail(fmt.Errorf("%s completed for %q with keeper %q; manifest write failed: %w", *mode, r.path, keeper.path, err))
+				}
+				if err := man.Sync(); err != nil {
+					return fail(fmt.Errorf("%s completed for %q with keeper %q; manifest sync failed: %w", *mode, r.path, keeper.path, err))
+				}
 			}
 			moved++
 			bytes += r.size
+		}
+	}
+	if man != nil {
+		if err := man.Close(); err != nil {
+			return fail(err)
 		}
 	}
 	fmt.Printf("changed=%d skipped=%d bytes=%s dry=%v free_before=%s free_after=%s\n",
@@ -735,20 +880,41 @@ func runApply(args []string) int {
 	return 0
 }
 
+// qstPath finds the existing ancestor used for a dry-run free-space reading.
+func qstPath(path string) string {
+	for {
+		if _, err := os.Lstat(path); err == nil || filepath.Dir(path) == path {
+			return path
+		}
+		path = filepath.Dir(path)
+	}
+}
+
 // dedupe makes dup share its extents with keeper through FIDEDUPERANGE. The
 // kernel compares the bytes itself and refuses (status DIFFERS) if they differ,
 // so no content can be lost; mtime, owner, ACLs and the path of dup are kept.
 func dedupe(keeper, dup string, size int64) error {
-	src, err := os.Open(keeper)
+	src, err := os.OpenFile(keeper, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
-	dst, err := os.OpenFile(dup, os.O_RDWR, 0)
+	dst, err := os.OpenFile(dup, os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return err
 	}
 	defer dst.Close()
+	srcInfo, err := src.Stat()
+	if err != nil {
+		return err
+	}
+	dstInfo, err := dst.Stat()
+	if err != nil {
+		return err
+	}
+	if size <= 0 || !srcInfo.Mode().IsRegular() || !dstInfo.Mode().IsRegular() || srcInfo.Size() != size || dstInfo.Size() != size || srcInfo.Sys().(*syscall.Stat_t).Dev != dstInfo.Sys().(*syscall.Stat_t).Dev {
+		return errors.New("dedupe requires regular files of the planned size on one filesystem")
+	}
 	const chunk = 16 << 20
 	for off := int64(0); off < size; {
 		r := unix.FileDedupeRange{
@@ -774,11 +940,14 @@ func dedupe(keeper, dup string, size int64) error {
 
 // unchanged guards against the file having been modified since the scan.
 func unchanged(r row) bool {
-	st, err := os.Lstat(r.path)
+	st, err := plainPath(r.path, false)
 	return err == nil && st.Mode().IsRegular() && st.Size() == r.size && st.ModTime().Unix() == r.mt
 }
 
 func sameDev(p string, q os.FileInfo) bool {
+	if q == nil {
+		return false
+	}
 	st, err := os.Lstat(p)
 	return err == nil && st.Sys().(*syscall.Stat_t).Dev == q.Sys().(*syscall.Stat_t).Dev
 }

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Preserve native Podman image names, distinguish untagged images, and keep
+  unknown container counts out of the tagged-without-containers total.
+- Report unavailable image stores explicitly and prevent incomplete queries
+  from classifying an unmatched image archive as absent.
+- Validate the complete duplicate plan before applying it, keep dry runs
+  free of writes, and refuse quarantine destination replacement.
+- Normalize scan roots to absolute paths and reject invalid roots or
+  numeric bounds before creating report files.
+
 ### Added
 
 - `tidyshare scan`: read-only scan of a directory tree. Categorises files by

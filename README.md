@@ -66,9 +66,11 @@ tidyshare apply -plan report/dups.tsv -mode dedupe -quarantine /srv/share/.tidys
 
 ## Safety
 
-`scan` never writes inside the scanned tree. `apply` does nothing without
+`scan` reads the selected files and writes reports only to `-out`, which is
+excluded from the scan. `apply` does nothing without
 `-yes`, skips any file whose size or mtime changed after the scan, refuses to
-cross a filesystem boundary and never deletes a file. See
+cross a filesystem boundary and never deletes a file. Use reviewed plans
+while the selected files and their parent directories are quiet. See
 [Design](docs/en/explanation/design.md).
 
 ## Documentation
