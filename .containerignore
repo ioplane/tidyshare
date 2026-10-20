@@ -1,0 +1,10 @@
+.git/
+.github/
+.idea/
+.vscode/
+coverage/
+.artifacts/
+tidyshare-report/
+*.out
+*.test
+.DS_Store

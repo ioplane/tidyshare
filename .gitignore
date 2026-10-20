@@ -1,0 +1,10 @@
+.cache/
+.idea/
+.vscode/
+coverage/
+.artifacts/
+tidyshare-report/
+/tidyshare
+*.out
+*.test
+.DS_Store
