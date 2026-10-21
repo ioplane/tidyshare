@@ -4,7 +4,9 @@ The [Release workflow](../../../.github/workflows/release.yml) builds Linux
 amd64 and arm64 binaries through [GoReleaser](https://goreleaser.com/) inside
 the digest-pinned Podman development image. Production binaries use
 `CGO_ENABLED=0`, the remote Podman build tags, trimmed source paths, the
-release version and the full source commit. No container image is published.
+release version and the full source commit. GoReleaser runs without network
+access or credentials, with its SCM publisher disabled. GitHub CLI handles
+release publication. No container image is published.
 
 ## Verify without publishing
 
@@ -28,7 +30,7 @@ Push that tag with an administrator account allowed by the repository's tag
 rules. A tag push starts publication automatically. A manual run on an existing
 tag publishes only with `dry_run=false`; a branch cannot publish.
 
-GoReleaser creates a draft release with raw binaries named
+GitHub CLI creates a draft release with raw binaries named
 `tidyshare_<tag>_linux_amd64` and `tidyshare_<tag>_linux_arm64`, plus
 `tidyshare_<tag>_checksums.txt`. Release notes use the existing
 [GitHub categories](../../../.github/release.yml). Prerelease tags retain their

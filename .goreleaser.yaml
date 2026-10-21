@@ -5,7 +5,7 @@ dist: .artifacts/release
 
 builds:
   - main: ./cmd/tidyshare
-    binary: "tidyshare_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    binary: tidyshare
     env:
       - CGO_ENABLED=0
     goos: [linux]
@@ -24,12 +24,7 @@ checksum:
   algorithm: sha256
 
 changelog:
-  use: github-native
+  disable: true
 
 release:
-  github:
-    owner: ioplane
-    name: tidyshare
-  draft: true
-  prerelease: auto
-  footer: ""
+  disable: true

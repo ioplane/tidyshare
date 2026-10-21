@@ -99,29 +99,46 @@ jobs:
           sudo podman compose run --rm race
           sudo podman compose run --rm vuln
 
-      - name: Build with GoReleaser and upload draft assets
+      - name: Build offline with GoReleaser
         env:
           PUBLISH: ${{ steps.mode.outputs.publish }}
-          GITHUB_TOKEN: ${{ steps.mode.outputs.publish == 'true' && github.token || '' }}
           GORELEASER_CURRENT_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
           set -euo pipefail
-          args=(release --clean)
+          args=(release --clean --skip=publish)
           if [[ "$PUBLISH" != true ]]; then
             args+=(--snapshot)
           fi
-          sudo --preserve-env=GITHUB_TOKEN,GORELEASER_CURRENT_TAG podman run --rm \
+          sudo --preserve-env=GORELEASER_CURRENT_TAG podman run --rm \
+            --network none \
             --security-opt no-new-privileges=true \
             --volume "$PWD:/workspace:rw" \
             --volume "$RUNNER_TEMP/goreleaser:/tools:ro" \
             --workdir /workspace \
-            --env GITHUB_TOKEN --env GORELEASER_CURRENT_TAG \
+            --env GORELEASER_CURRENT_TAG \
             --env HOME=/tmp/home --env GOCACHE=/tmp/go-build \
             localhost/ioplane/tidyshare-dev:1.27.3 \
             sh -ec '/tools/goreleaser check; exec /tools/goreleaser "$@"' sh "${args[@]}"
           sudo chown -R "$(id -u):$(id -g)" .artifacts
-          cp .artifacts/release/tidyshare_linux_*/* .artifacts/release/
+          jq -r '.[] | select(.type == "Binary" and .extra.Format == "binary") | [.path, .name] | @tsv' \
+            .artifacts/release/artifacts.json |
+            while IFS=$'\t' read -r source name; do
+              cp -- "$source" ".artifacts/release/$name"
+            done
           (cd .artifacts/release && sha256sum --check tidyshare_v*_checksums.txt)
+
+      - name: Create draft and upload release assets
+        if: ${{ steps.mode.outputs.publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          args=(--draft --verify-tag --generate-notes --title "$TAG")
+          if [[ "$TAG" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" .artifacts/release/tidyshare_v* "${args[@]}"
 
       - name: Attest build provenance
         if: ${{ steps.mode.outputs.publish == 'true' }}
