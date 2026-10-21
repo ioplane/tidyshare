@@ -40,7 +40,7 @@ install -m 0755 tidyshare_<version>_linux_amd64 /usr/local/bin/tidyshare
 Or build from source with Go:
 
 ```bash
-go install github.com/ioplane/tidyshare/cmd/tidyshare@latest
+go install -tags remote,exclude_graphdriver_btrfs,containers_image_openpgp github.com/ioplane/tidyshare/cmd/tidyshare@latest
 ```
 
 ## Quick start
@@ -62,7 +62,8 @@ tidyshare apply -plan report/dups.tsv -mode dedupe -quarantine /srv/share/.tidys
 - Linux. `scan` also reads from any tree the user can read.
 - `apply -mode dedupe`: a filesystem with `FIDEDUPERANGE` support (XFS with
   `reflink=1`, Btrfs).
-- Optional: `podman` for image matching, `yara` 4.x for rule scans.
+- Optional: a running local Podman API service for image matching, `yara`
+  4.x for rule scans. Inventory uses the official Podman Go SDK.
 
 ## Safety
 

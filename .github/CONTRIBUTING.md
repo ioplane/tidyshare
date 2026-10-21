@@ -35,6 +35,10 @@ Mark incompatible CLI, report-column or exit-code changes with `!` and a
 
 Formatting, analysis and tests run in the pinned image defined by the
 [Containerfile](../Containerfile). Podman is the supported container engine.
+The image sets `GOFLAGS` to build the official remote Podman client with
+`remote,exclude_graphdriver_btrfs,containers_image_openpgp`; these tags keep production builds free of
+CGO and local storage-engine dependencies. Use the same tags for direct Go
+commands outside the image.
 
 ```bash
 podman build --tag localhost/ioplane/tidyshare-dev:1.27.3 --file Containerfile .

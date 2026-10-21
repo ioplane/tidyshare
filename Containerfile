@@ -16,7 +16,7 @@ LABEL org.opencontainers.image.source="https://github.com/ioplane/tidyshare" \
 ENV CGO_ENABLED=0 \
     GOCACHE=/tmp/go-build \
     GOMODCACHE=/opt/go/pkg/mod \
-    GOFLAGS=-buildvcs=false
+    GOFLAGS="-buildvcs=false -tags=remote,exclude_graphdriver_btrfs,containers_image_openpgp"
 
 COPY --from=tools /opt/tools/ /usr/local/bin/
 

@@ -71,7 +71,8 @@ type opts struct {
 	staleDays          int
 	workers, depth     int
 	skip               map[string]bool
-	engine, imageUsers string
+	imageUsers         string
+	imageSockets       map[string]string
 	images             bool
 	yaraRules, yaraBin string
 	yaraCats           string
@@ -126,7 +127,8 @@ func runScan(args []string) int {
 	fs.IntVar(&o.workers, "workers", 8, "parallel hashers")
 	fs.IntVar(&o.depth, "depth", 3, "directory summary depth under root")
 	fs.BoolVar(&o.images, "images", true, "scan container images and match image archives")
-	fs.StringVar(&o.engine, "engine", "podman", "container engine binary; only podman JSON output is parsed")
+	engine := fs.String("engine", "podman", "deprecated: only podman is supported; inventory uses the Go SDK")
+	imageSockets := fs.String("image-sockets", "", "comma-separated owner=unix:///path API sockets for requested image stores")
 	fs.StringVar(&o.imageUsers, "image-users", "", "comma-separated rootless users whose storage is also listed")
 	fs.StringVar(&o.yaraRules, "yara-rules", "", "YARA rules file or directory (empty = no YARA scan)")
 	fs.StringVar(&o.yaraBin, "yara-bin", "yara", "classic yara CLI (needs --scan-list)")
@@ -143,6 +145,14 @@ func runScan(args []string) int {
 	}
 	if o.workers <= 0 || o.minSize <= 0 || o.settle < 0 || o.staleDays < 0 || o.depth < 0 || fs.NArg() != 0 {
 		return fail(errors.New("workers and min-size must be positive; settle, stale-days and depth must be non-negative; no positional arguments"))
+	}
+	if *engine != "podman" {
+		return fail(errors.New("-engine no longer executes binaries; use -image-sockets with the Podman API"))
+	}
+	var err error
+	o.imageSockets, err = parseImageSockets(*imageSockets, o.imageUsers)
+	if err != nil {
+		return fail(err)
 	}
 	root, err := filepath.Abs(o.root)
 	if err != nil {

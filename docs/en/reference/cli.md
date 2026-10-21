@@ -23,8 +23,9 @@ tidyshare <command> [flags]
 | `-depth` | `3` | directory summary depth under the root |
 | `-skip` | empty | comma-separated absolute directories to skip |
 | `-images` | `true` | list podman images and match image archives |
-| `-engine` | `podman` | container engine binary; only podman JSON is parsed |
+| `-engine` | `podman` | deprecated compatibility flag; only `podman` is accepted and no binary is executed |
 | `-image-users` | empty | rootless users whose storage is also listed |
+| `-image-sockets` | empty | comma-separated requested `owner=unix:///path` API endpoint overrides |
 | `-yara-rules` | empty | rules file or directory; empty disables YARA |
 | `-yara-bin` | `yara` | classic yara CLI with `--scan-list` |
 | `-yara-cats` | `binary,installer,package,firmware,dump` | categories to scan |

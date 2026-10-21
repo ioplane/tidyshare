@@ -4,14 +4,11 @@ import (
 	"archive/tar"
 	"bufio"
 	"compress/gzip"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
-	"os/user"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -19,11 +16,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
-	"time"
 )
 
-// localImage is one image from `podman images`; ID is the config digest (hex).
+// localImage is one image from the Podman API; ID is the config digest (hex).
 type localImage struct {
 	ID, Owner  string
 	Tags       []string
@@ -62,10 +57,10 @@ func scanImages(es []entry, o opts) imageReport {
 			continue
 		}
 		seen[ow] = true
-		imgs, df, err := listLocal(o.engine, ow)
+		imgs, df, err := listLocal(o.imageSockets[ow], ow)
 		if err != nil {
 			r.Unavailable[ow] = err.Error()
-			fmt.Fprintf(os.Stderr, "warn: %s images (%s): %v\n", o.engine, ow, err)
+			fmt.Fprintf(os.Stderr, "warn: Podman API images (%s): %v\n", ow, err)
 			continue
 		}
 		r.Local = append(r.Local, imgs...)
@@ -146,95 +141,6 @@ func splitList(s string) []string {
 		}
 	}
 	return out
-}
-
-// listLocal runs the engine as owner (root directly, others through runuser).
-// Only podman's JSON shape is parsed; a `docker` binary works only when it is
-// a podman shim.
-func listLocal(engine, owner string) ([]localImage, string, error) {
-	if owner == "root" && os.Geteuid() != 0 {
-		return nil, "", errors.New("root store requires root privileges")
-	}
-	run := func(args ...string) ([]byte, error) {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		var c *exec.Cmd
-		if owner == "root" {
-			c = exec.CommandContext(ctx, engine, args...)
-		} else {
-			u, err := user.Lookup(owner)
-			if err != nil {
-				return nil, err
-			}
-			runtimeDir := filepath.Join("/run/user", u.Uid)
-			if err := validateRuntimeDir(runtimeDir, u.Uid); err != nil {
-				return nil, err
-			}
-			c = exec.CommandContext(ctx, "runuser", append([]string{
-				"-u", owner, "--", "env",
-				"HOME=" + u.HomeDir, "XDG_RUNTIME_DIR=" + runtimeDir, engine,
-			}, args...)...)
-			c.Dir = "/" // the caller's cwd may be unreadable for the target user
-		}
-		out, err := c.Output()
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			err = fmt.Errorf("%w: %s", err, firstLine(ee.Stderr))
-		}
-		return out, err
-	}
-	out, err := run("images", "--all", "--no-trunc", "--format", "json")
-	if err != nil {
-		return nil, "", err
-	}
-	var raw []struct {
-		ID         string   `json:"Id"`
-		RepoTags   []string `json:"RepoTags"`
-		Names      []string
-		Size       int64
-		Created    int64
-		Dangling   bool
-		Containers *int
-	}
-	if err := json.Unmarshal(out, &raw); err != nil {
-		return nil, "", err
-	}
-	var imgs []localImage
-	for _, x := range raw {
-		var tags []string
-		for _, names := range [][]string{x.Names, x.RepoTags} {
-			tags = slices.DeleteFunc(names, func(s string) bool { return s == "" || s == "<none>" || s == "<none>:<none>" })
-			if len(tags) > 0 {
-				break
-			}
-		}
-		containers := -1
-		if x.Containers != nil {
-			containers = *x.Containers
-		}
-		imgs = append(imgs, localImage{
-			ID: strings.TrimPrefix(x.ID, "sha256:"), Owner: owner,
-			Tags: tags, Size: x.Size, Created: x.Created, Dangling: x.Dangling, Containers: containers,
-		})
-	}
-	df, _ := run("system", "df")
-	return imgs, string(df), nil
-}
-
-// A dormant store must not be started with an invented runtime directory.
-func validateRuntimeDir(path, uid string) error {
-	st, err := os.Lstat(path)
-	if err != nil {
-		return fmt.Errorf("rootless runtime unavailable: %w", err)
-	}
-	owner, err := strconv.ParseUint(uid, 10, 32)
-	if err != nil {
-		return fmt.Errorf("invalid runtime owner: %w", err)
-	}
-	if !st.IsDir() || st.Mode().Perm()&0o077 != 0 || uint64(st.Sys().(*syscall.Stat_t).Uid) != owner {
-		return errors.New("rootless runtime must be a private directory owned by the requested user")
-	}
-	return nil
 }
 
 // readArchive reads manifest.json / index.json from a docker-archive or
@@ -418,7 +324,7 @@ func writeImages(r imageReport, o opts) error {
 	slices.Sort(owners)
 	for _, ow := range owners {
 		df := r.SystemDF[ow]
-		fmt.Fprintf(md, "## `%s system df` (%s)\n\n```text\n%s```\n\n", o.engine, ow, df)
+		fmt.Fprintf(md, "## Podman API disk usage (%s)\n\n```text\n%s```\n\n", ow, df)
 	}
 	fmt.Fprint(md, "## Image archives vs local storage\n\n| status | size | ids | tags | stores | path |\n|:---|---:|:---|:---|:---|:---|\n")
 	for _, a := range r.Archives {

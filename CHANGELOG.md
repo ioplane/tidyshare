@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Query Podman through the official Go SDK and accept explicit owner-bound
+  Unix sockets with `-image-sockets`, including nonstandard rootless runtimes.
+  Scanning never starts or recovers an API service. The deprecated `-engine`
+  flag accepts only `podman`; custom engine binaries are no longer executed.
+- Build the remote SDK client with `remote,exclude_graphdriver_btrfs,containers_image_openpgp` tags to
+  retain CGO-free release binaries.
+
 ### Fixed
 
+- Preserve image inventory and archive matches when optional Podman disk-usage
+  statistics are unavailable.
 - Preserve native Podman image names, distinguish untagged images, and keep
   unknown container counts out of the tagged-without-containers total.
 - Report unavailable image stores explicitly and prevent incomplete queries
