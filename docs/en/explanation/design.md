@@ -14,11 +14,16 @@ flowchart LR
     mime --> img[Image archives]
     img --> cand
     plan -. reviewed .-> apply[apply]
+    plan -. reviewed .-> cleanup[cleanup duplicates]
+    inventory[Podman inventory] --> imageplan[image-plan.json]
+    imageplan -. reviewed .-> images[cleanup images]
 ```
 
-`scan` reads input files and writes reports under `-out`; that directory is
-excluded from the walk. `apply` changes files from a reviewed plan and writes
-its operation manifest under `-quarantine`.
+`scan` reads input files, stages reports in a private temporary directory and
+publishes selected formats under `-out`; that directory is excluded from the
+walk. Final report files are reserved exclusively and never replace existing
+files. `apply` changes files from a reviewed plan and writes its operation
+manifest under `-quarantine`.
 
 ## Duplicate detection
 
@@ -45,6 +50,36 @@ no space until the other is gone as well.
 Replacing two independently allocated identical extents with one shared
 extent can free space immediately. Logical duplicate totals do not measure
 that gain; already shared extents and sparse files can reduce it to zero.
+
+## Explicit cleanup
+
+`cleanup` is a separate deletion command, with dry run as its default.
+Duplicate cleanup opens single-link regular files through pinned directory
+descriptors, compares complete contents and rechecks identity. Execution
+claims a duplicate into a private same-directory location, compares again
+and unlinks it. Refused claims are restored without replacing another file;
+failed restoration retains a recovery copy whose path appears in the report.
+A process crash can leave a private claim directory. Inspect it before retrying.
+
+Image cleanup binds a reviewed exact-ID plan to one owner, Unix socket and
+store. Fresh image and container inventories precede each removal. Only
+unnamed dangling images without child images or container references qualify;
+SDK removal disables force, ignore and parent pruning.
+
+Both operations reserve selected JSON, JSONL or Markdown reports before
+mutation and preserve completed outcomes on an operational error. Report
+write failures remain errors; a crash can leave incomplete report files.
+Logical byte totals do not establish physically recovered disk space.
+
+## MCP boundary
+
+The stdio server exposes the same CLI operations through typed tools. Startup
+fixes the data root, separate report parent and image owner/socket. Each call
+gets a private report directory; cleanup plans are snapshotted and validated
+before invoking a bounded, cancellable child process. Data deletion requires
+both a startup execution gate and an explicit per-call execution argument.
+Path checks assume quiet directories and are not a sandbox against concurrent
+directory moves. See [Use the local MCP server](../howto/use-mcp.md).
 
 ## Tiers
 

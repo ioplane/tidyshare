@@ -102,20 +102,20 @@ func (t podmanReadTransport) RoundTrip(r *http.Request) (*http.Response, error) 
 	return response, err
 }
 
-func listLocal(endpoint, owner string) ([]localImage, string, error) {
+func podmanOwnerSocket(owner, endpoint string) (string, uint64, error) {
 	if owner == "root" && os.Geteuid() != 0 {
-		return nil, "", errors.New("root store requires root privileges")
+		return "", 0, errors.New("root store requires root privileges")
 	}
 	u, err := user.Lookup(owner)
 	if err != nil {
-		return nil, "", err
+		return "", 0, err
 	}
 	uid, err := strconv.ParseUint(u.Uid, 10, 32)
 	if err != nil {
-		return nil, "", fmt.Errorf("invalid Podman owner: %w", err)
+		return "", 0, fmt.Errorf("invalid Podman owner: %w", err)
 	}
 	if os.Geteuid() != 0 && uint64(os.Geteuid()) != uid {
-		return nil, "", errors.New("podman store requires its owner or root privileges")
+		return "", 0, errors.New("podman store requires its owner or root privileges")
 	}
 	if endpoint == "" {
 		path := "/run/podman/podman.sock"
@@ -126,14 +126,22 @@ func listLocal(endpoint, owner string) ([]localImage, string, error) {
 	}
 	path, err := socketPath(endpoint)
 	if err != nil {
-		return nil, "", err
+		return "", 0, err
 	}
 	st, err := os.Lstat(path)
 	if err != nil {
-		return nil, "", fmt.Errorf("podman API unavailable; start the owner's service separately or set -image-sockets %s=unix:///path: %w", owner, err)
+		return "", 0, fmt.Errorf("podman API unavailable; start the owner's service separately or set -image-sockets %s=unix:///path: %w", owner, err)
 	}
 	if st.Mode()&os.ModeSocket == 0 || uint64(st.Sys().(*syscall.Stat_t).Uid) != uid || st.Mode().Perm()&0o002 != 0 {
-		return nil, "", errors.New("podman socket must be a socket owned by the requested owner and not writable by others")
+		return "", 0, errors.New("podman socket must be a socket owned by the requested owner and not writable by others")
+	}
+	return endpoint, uid, nil
+}
+
+func listLocal(endpoint, owner string) ([]localImage, string, error) {
+	endpoint, uid, err := podmanOwnerSocket(owner, endpoint)
+	if err != nil {
+		return nil, "", err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()

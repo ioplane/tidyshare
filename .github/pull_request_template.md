@@ -6,7 +6,8 @@
 
 ## Safety and compatibility
 
-- [ ] `scan` stays read-only; no new write outside `-out`.
+- [ ] `scan` keeps source data read-only; writes are limited to private temporary
+      staging and reports under `-out`.
 - [ ] Any change to `apply` keeps dry run as the default and re-checks size and
       mtime before touching a file.
 - [ ] CLI flags, report columns and exit codes are unchanged, or the change is

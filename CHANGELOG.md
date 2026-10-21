@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Report publication refuses existing output files instead of replacing them.
+  Use a new output directory for each run (breaking change).
 - Query Podman through the official Go SDK and accept explicit owner-bound
   Unix sockets with `-image-sockets`, including nonstandard rootless runtimes.
   Scanning never starts or recovers an API service. The deprecated `-engine`
@@ -32,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `cleanup -kind duplicates` deletes reviewed byte-identical copies while
+  preserving the keeper; `-yes` is required to execute instead of dry run.
+- `images-plan` and `cleanup -kind images` review and remove exact dangling
+  Podman image IDs with fresh store and container-reference checks.
+- Selectable `-formats json,jsonl,md` reports for scan and cleanup operations,
+  with structured summaries and per-target outcomes.
+- Local stdio MCP tools for scanning, image planning and cleanup within
+  startup-bound roots and image sockets. Cleanup execution requires both
+  `-allow-cleanup` and the tool's `execute` argument.
 - `tidyshare scan`: read-only scan of a directory tree. Categorises files by
   extension and by content (MIME), finds byte-identical duplicates with a
   size, head/tail and full xxh3-128 cascade, flags junk and cold files, and

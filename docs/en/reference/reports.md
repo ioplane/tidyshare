@@ -1,11 +1,17 @@
 # Report files
 
-`scan` writes these files to `-out`.
+`scan -formats json,jsonl,md` writes reports to `-out`. This is the default;
+select any comma-separated combination to omit other renderings. TSV plans
+and optional YARA inputs remain available with every selection. Use a fresh
+output directory: publication refuses existing target files and symlinks in
+every directory component. New directories use mode `0700`; reports use `0600`.
 
 | File | Content |
 | --- | --- |
 | `report.md` | totals; tables by category, MIME type, top-level area, directory and cold directory |
 | `catalog.jsonl` | one JSON object per file: `path`, `area`, `category`, `mime`, `size`, `mtime`, `atime`, `stale` |
+| `report.json` | versioned scan object containing the root and semantic records from the catalog and TSV tables |
+| `report.jsonl` | versioned summary followed by one semantic record per line |
 | `dups.tsv` | duplicate plan, columns `group`, `action`, `size`, `mtime`, `path` |
 | `stale.tsv` | stale files, columns `reason`, `size`, `mtime`, `atime`, `path` |
 | `candidates.md` | deletion candidates by tier, directory and file |
@@ -14,6 +20,43 @@
 | `yara.tsv`, `yara.list`, `yara.err`, `yara-index.yar` | YARA results and inputs (with `-yara-rules`) |
 
 Paths in TSV files are Go-quoted strings.
+
+## Structured scan reports
+
+`report.json` contains `schema_version: 1`, `operation: "scan"`, `root`, and
+`records`. Each record contains `schema_version: 1`, `type`, and `data`.
+Types are `catalog`, `dups`, `stale`, `candidates`, `images`, and `yara` when
+their source table is present. Catalog fields retain JSON numbers; TSV fields
+are strings, with Go-quoted values decoded. The machine formats include every
+table row rather than the largest-row limits of Markdown summaries.
+
+`report.jsonl` starts with a `summary` record whose `data` contains `operation`,
+`root`, and the number of following records. Subsequent records have the same
+shape and meaning as `report.json.records`. `catalog.jsonl` remains the legacy
+catalog stream and is emitted only when `jsonl` is selected.
+
+For example, `scan -root /srv/share -out ./report -formats json` writes
+`report.json`, `dups.tsv`, `stale.tsv`, `candidates.tsv`, and enabled image or
+YARA TSV/input files. It omits all Markdown and JSONL files.
+
+## Cleanup operation reports
+
+Cleanup commands use the same `-formats` selection and write
+`cleanup.json`, `cleanup.jsonl`, and `cleanup.md` to their selected output
+directory. All destinations are reserved before an operation changes data;
+an existing regular file, hardlink, symlink, or directory at a target is a
+refusal. A write or sync failure remains an error even after cleanup has run;
+inspect the operation result before retrying a mutation. Reserved files can
+remain empty after an interrupted or rejected operation.
+
+Schema version 1 contains `operation`, `dry_run`, `results`, `changed`,
+`skipped`, and `logical_bytes`. Results contain `target`, `status`, and
+optional `keeper`, `owner`, `reason`, and `bytes`. JSONL starts with a
+`type: "summary"` record containing the totals and operation metadata, then
+one `type: "result"` record per result; every record has `schema_version: 1`.
+Markdown contains the same metadata, totals, and results. Logical bytes do
+not measure physical space reclaimed. Paths and identifiers are local to the
+explicitly selected scan or cleanup scope; reports are private local files.
 
 ## `dups.tsv`
 
