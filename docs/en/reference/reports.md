@@ -60,6 +60,27 @@ Markdown contains the same metadata, totals, and results. Logical bytes do
 not measure physical space reclaimed. Paths and identifiers are local to the
 explicitly selected scan or cleanup scope; reports are private local files.
 
+## Developer storage reports
+
+`discover` writes selected `discovery.json`, `discovery.jsonl` and
+`discovery.md`, plus the always-retained `cache-plan.json`. JSON schema version 1
+contains `operation: "discover"`, `root`, `caches`, `git_trees` and `warnings`.
+Cache records include `kind`, `path`, logical `bytes`, regular `files`,
+`device`, `inode`, `uid`, `cleanup` and an optional `reason`. The boolean
+describes an implemented cleanup policy; execution still checks current
+identity, occupancy, mounts and source-data guards. Git records include `path`,
+`kind`, available `git_dir`, `common_dir`, `head`, `branch`, and boolean
+`locked`, `prunable`, `missing`, plus an optional `reason`.
+
+JSONL starts with a `summary` record and follows with `cache`, `git_tree` or
+`warning` records. Every record has `schema_version: 1`, `type` and `data`.
+Markdown renders the same inventory and warnings with escaped table cells.
+
+The cache plan contains `schema_version: 1`, the discovery `root`, and `targets`
+selected from caches whose cleanup policy is implemented. Each target binds its
+kind and path to device, inode and owner. Editing the target list narrows scope;
+it does not bypass current cache qualification or permit arbitrary commands.
+
 ## `dups.tsv`
 
 `action` is `keep` for the copy to retain and `dup` for each redundant copy.

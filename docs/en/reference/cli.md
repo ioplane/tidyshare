@@ -7,9 +7,10 @@ tidyshare <command> [flags]
 | Command | Purpose |
 | --- | --- |
 | `scan` | read-only scan; writes reports to `-out` |
+| `discover` | find language caches and Git trees; write a reviewed-cache plan |
 | `apply` | act on a reviewed `dups.tsv` (dry run unless `-yes`) |
 | `images-plan` | prepare an exact owner-bound orphan image plan |
-| `cleanup` | delete reviewed copies or orphan images (dry run unless `-yes`) |
+| `cleanup` | clear reviewed caches, copies or orphan images (dry run unless `-yes`) |
 | `mcp` | expose local operations over stdio within startup boundaries |
 | `version` | print version and commit |
 
@@ -47,14 +48,30 @@ tidyshare <command> [flags]
 
 ## `cleanup`
 
-`-kind duplicates|images`, `-plan` and `-out` are required. `-formats` selects
+`-kind duplicates|images|caches`, `-plan` and `-out` are required. `-formats` selects
 one or more of `json,jsonl,md` (default `md`). `-yes` performs deletion;
 without it the command only reviews the targets and writes reports. `-limit`
 limits processed targets (default `0`, all). Duplicate plans use `dups.tsv`
-(up to 64 MiB); image plans use strict `image-plan.json` (up to 8 MiB).
+(up to 64 MiB); image and cache plans use strict JSON (up to 8 MiB).
 Skips are recorded even when the exit status is zero. A failed operation stops
 and writes the accumulated result where possible. Existing report files are
 never replaced; use a separate directory for each run.
+
+Cache cleanup uses `cache-plan.json` from `discover`. The reviewed plan and
+report directory must remain outside every cleanup target. Source files,
+environments and mixed Maven repositories are protected; unsupported or
+unavailable native cleaners are explicitly reported. See
+[Clean language caches](../howto/clean-language-caches.md).
+
+## `discover`
+
+`-root` and `-out` are required. The root must be a real directory without
+symlink components and differ from the output directory. `-formats` defaults
+to `json,jsonl,md`; `cache-plan.json` is always retained. The command inventories
+known cache layouts and current environment-derived cache locations beneath
+the root, plus Git metadata and linked-worktree registrations. It neither
+hashes source files nor executes package managers or repository code.
+Incomplete discovery preserves reports and returns exit status 1.
 
 ## `images-plan`
 

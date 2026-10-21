@@ -91,9 +91,10 @@ const usage = `usage: tidyshare <command> [flags]
 
 commands:
   scan      read-only scan; writes reports to -out
+  discover  find language caches and Git trees; write a cache cleanup plan
   apply     act on a reviewed dups.tsv (dry run unless -yes)
   images-plan  plan conservative orphan image cleanup
-  cleanup   delete reviewed duplicate files or orphan images (dry run unless -yes)
+  cleanup   clear reviewed caches, duplicate files or orphan images (dry run unless -yes)
   mcp       serve local MCP tools over stdio
   version   print version
 
@@ -108,6 +109,8 @@ func main() {
 	switch cmd {
 	case "scan":
 		os.Exit(runScan(os.Args[2:]))
+	case "discover":
+		os.Exit(runDiscover(os.Args[2:]))
 	case "apply":
 		os.Exit(runApply(os.Args[2:]))
 	case "cleanup":

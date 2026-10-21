@@ -81,6 +81,20 @@ both a startup execution gate and an explicit per-call execution argument.
 Path checks assume quiet directories and are not a sandbox against concurrent
 directory moves. See [Use the local MCP server](../howto/use-mcp.md).
 
+## Developer storage
+
+`discover` walks directory entries without source hashing. It measures known
+cache roots with descriptor-relative traversal and reads Git metadata only
+when a repository marker is found. Cache payloads and Git administration
+directories are excluded from the general walk. The inventory and cleanup
+allowlist retain directories and repositories, not a second per-file catalog.
+
+Cache cleanup uses fixed manager commands where cache locking or opaque formats
+require them. Cargo archives and guarded Gradle cache payloads use pinned
+directory descriptors. A reviewed plan binds roots to their device, inode and
+owner; execution checks process use and nested mounts before mutation. Mixed
+Maven repositories and unsupported Yarn cleaners remain discovery records.
+
 ## Tiers
 
 Tier 1 is content that exists elsewhere or has junk names. Tier 2 needs a

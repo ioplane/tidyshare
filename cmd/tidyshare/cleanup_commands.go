@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,41 +16,82 @@ import (
 
 func readImagePlan(path string) (imageCleanupPlan, error) {
 	var plan imageCleanupPlan
-	path, err := filepath.Abs(path)
-	if err != nil {
+	if err := readStructuredPlan(path, &plan); err != nil {
 		return plan, err
-	}
-	if _, err := plainPath(path, false); err != nil {
-		return plan, err
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return plan, err
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return plan, err
-	}
-	if !st.Mode().IsRegular() || st.Size() > 8<<20 {
-		return plan, errors.New("image plan must be a regular file no larger than 8 MiB")
-	}
-	d := json.NewDecoder(io.LimitReader(f, (8<<20)+1))
-	d.DisallowUnknownFields()
-	if err := d.Decode(&plan); err != nil {
-		return plan, fmt.Errorf("decode image plan: %w", err)
-	}
-	var extra any
-	if err := d.Decode(&extra); !errors.Is(err, io.EOF) {
-		return plan, errors.New("image plan contains trailing data")
 	}
 	return plan, validateImageCleanupPlan(plan)
 }
 
+func readCachePlan(path string) (cachePlan, error) {
+	var plan cachePlan
+	if err := readStructuredPlan(path, &plan); err != nil {
+		return plan, err
+	}
+	return plan, validateCachePlan(plan)
+}
+
+func readStructuredPlan(path string, value any) error {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	if _, err := plainPath(path, false); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() || st.Size() > 8<<20 {
+		return errors.New("structured plan must be a regular file no larger than 8 MiB")
+	}
+	body, err := io.ReadAll(io.LimitReader(f, (8<<20)+1))
+	if err != nil {
+		return err
+	}
+	return decodeStructuredPlan(body, value)
+}
+
+func decodeStructuredPlan(body []byte, value any) error {
+	if len(body) > 8<<20 {
+		return errors.New("structured plan exceeds 8 MiB")
+	}
+	d := json.NewDecoder(bytes.NewReader(body))
+	d.DisallowUnknownFields()
+	if err := d.Decode(value); err != nil {
+		return fmt.Errorf("decode structured plan: %w", err)
+	}
+	var extra any
+	if err := d.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("structured plan contains trailing data")
+	}
+	return nil
+}
+
+func cachePlanLocations(plan cachePlan, source, out string) error {
+	for _, path := range []string{source, out} {
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		for _, target := range plan.Targets {
+			if cacheWithin(target.Path, absolute) {
+				return errors.New("cache plan and reports must remain outside cleanup targets")
+			}
+		}
+	}
+	return nil
+}
+
 func runCleanup(args []string) int {
 	f := flag.NewFlagSet("cleanup", flag.ContinueOnError)
-	kind := f.String("kind", "", "duplicates or images (required)")
-	plan := f.String("plan", "", "reviewed dups.tsv or image-plan.json (required)")
+	kind := f.String("kind", "", "duplicates, images or caches (required)")
+	plan := f.String("plan", "", "reviewed dups.tsv, image-plan.json or cache-plan.json (required)")
 	out := f.String("out", "", "new report directory (required)")
 	format := f.String("formats", "md", "comma-separated json,jsonl,md")
 	execute := f.Bool("yes", false, "execute deletion (default: dry run)")
@@ -60,8 +102,8 @@ func runCleanup(args []string) int {
 		}
 		return fail(err)
 	}
-	if (*kind != "duplicates" && *kind != "images") || *plan == "" || *out == "" || *limit < 0 || f.NArg() != 0 {
-		return fail(errors.New("-kind duplicates|images, -plan and -out are required; limit must be non-negative; no positional arguments"))
+	if (*kind != "duplicates" && *kind != "images" && *kind != "caches") || *plan == "" || *out == "" || *limit < 0 || f.NArg() != 0 {
+		return fail(errors.New("-kind duplicates|images|caches, -plan and -out are required; limit must be non-negative; no positional arguments"))
 	}
 	formats, err := parseReportFormats(*format)
 	if err != nil {
@@ -69,9 +111,16 @@ func runCleanup(args []string) int {
 	}
 	// Parse the entire input before reserving reports or making any deletion.
 	var imagePlan imageCleanupPlan
-	if *kind == "images" {
+	var caches cachePlan
+	switch *kind {
+	case "images":
 		imagePlan, err = readImagePlan(*plan)
-	} else {
+	case "caches":
+		caches, err = readCachePlan(*plan)
+		if err == nil {
+			err = cachePlanLocations(caches, *plan, *out)
+		}
+	default:
 		_, _, err = readDuplicatePlan(*plan)
 	}
 	if err != nil {
@@ -85,9 +134,12 @@ func runCleanup(args []string) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	var report cleanupReport
-	if *kind == "images" {
+	switch *kind {
+	case "images":
 		report, err = cleanupImages(ctx, imagePlan, *execute, *limit)
-	} else {
+	case "caches":
+		report, err = cleanupCaches(ctx, caches, *execute, *limit)
+	default:
 		report, err = cleanupDuplicates(ctx, *plan, *execute, *limit)
 	}
 	reportErr := finish(report)

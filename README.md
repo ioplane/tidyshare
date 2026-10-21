@@ -31,6 +31,8 @@ operations within configured filesystem and image-store boundaries.
 - **Cleanup** reviewed duplicate files or unnamed orphan images: revalidate
   every target and use `-yes` only after reviewing the dry-run report.
 - **Reports** in selectable JSON, JSONL and Markdown formats (`-formats`).
+- **Developer storage**: finds language caches and Git trees; clears selected
+  caches from a reviewed plan with busy-process and source-data guards.
 - **MCP** over local stdio, scoped to an explicit root and image store;
   deletion requires startup opt-in and an explicit tool request.
 
@@ -74,6 +76,16 @@ tidyshare cleanup -kind images -plan image-review/image-plan.json -out ./image-c
 tidyshare mcp -root /srv/share -out /var/tmp/tidyshare-reports
 ```
 
+Find developer caches and Git trees, then review a cache cleanup dry run:
+
+```bash
+tidyshare discover -root /srv/developers -out ./developer-review -formats json,jsonl,md
+tidyshare cleanup -kind caches -plan developer-review/cache-plan.json -out ./cache-review
+```
+
+See [language cache cleanup](docs/en/howto/clean-language-caches.md) for the
+supported managers, protected storage and execution workflow.
+
 ## Requirements
 
 - Linux. `scan` also reads from any tree the user can read.
@@ -100,6 +112,8 @@ An image plan is not a backup; retain a verified recovery source before deletion
 | Topic | Document |
 | --- | --- |
 | Scan a share | [docs/en/howto/scan-a-share.md](docs/en/howto/scan-a-share.md) |
+| Find developer storage | [docs/en/howto/find-developer-storage.md](docs/en/howto/find-developer-storage.md) |
+| Clean language caches | [docs/en/howto/clean-language-caches.md](docs/en/howto/clean-language-caches.md) |
 | Reclaim space | [docs/en/howto/reclaim-space.md](docs/en/howto/reclaim-space.md) |
 | Clean orphan images | [docs/en/howto/clean-images.md](docs/en/howto/clean-images.md) |
 | Use MCP | [docs/en/howto/use-mcp.md](docs/en/howto/use-mcp.md) |

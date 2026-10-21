@@ -22,10 +22,12 @@ can contain file paths; keep the report parent accessible only to its operator.
 
 | Tool | Input | Effect |
 | --- | --- | --- |
+| `discover` | Optional `path`, `formats` | Finds language caches and Git trees inside the configured root; writes inventory and `cache-plan.json` |
 | `scan` | Optional `path`, `min_size`, `formats` | Reads a directory within the configured root; writes reports and `dups.tsv`; image inventory is disabled |
 | `plan_images` | Optional `formats` | Reads the fixed Podman store; writes `image-plan.json` and reports |
 | `cleanup_duplicates` | `plan_path`, optional `execute`, `limit`, `formats` | Validates every keeper and duplicate under the configured data root; dry run by default |
 | `cleanup_images` | `plan_path`, optional `execute`, `limit`, `formats` | Requires the plan owner and endpoint to match the startup configuration; dry run by default |
+| `cleanup_caches` | `plan_path`, optional `execute`, `limit`, `formats` | Validates cache paths and the plan root against the configured root; dry run by default |
 
 `formats` is a comma-separated selection of `json,jsonl,md`; omitted means all
 three. `scan.min_size` defaults to 1 MiB. `limit` defaults to zero (all eligible
@@ -54,7 +56,9 @@ Plans must be absolute paths under the configured root or report parent, be
 regular files, contain no symlink path components and fit within 8 MiB. The
 server saves a private snapshot before validating it and invoking the existing
 CLI operation. Duplicate source paths and keeper paths must be under the data
-root and outside the report parent. Symlinks and replaced startup directories
+root and outside the report parent. Cache targets and the cache plan's root
+must also remain within the data root. Plans and reports cannot be placed
+inside cache cleanup targets. Symlinks and replaced startup directories
 are refused. Keep source trees and their parent directories quiet during calls;
 path validation is not a filesystem sandbox against concurrent directory moves.
 

@@ -90,7 +90,7 @@ func TestMCPStdioIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(tools.Tools) != 4 {
+			if len(tools.Tools) != 6 {
 				t.Fatalf("tools = %d", len(tools.Tools))
 			}
 			for _, tool := range tools.Tools {
