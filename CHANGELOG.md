@@ -36,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- GoReleaser builds Linux amd64/arm64 release assets in the pinned Podman
+  toolchain, with SHA256 checksums, provenance and a no-publish Actions snapshot.
 - `discover` inventories known language caches and Git trees without source
   hashing or executing repository configuration, and writes an exact cache plan.
 - `cleanup -kind caches` clears reviewed caches with identity, process-use,

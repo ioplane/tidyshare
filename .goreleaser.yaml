@@ -1,0 +1,30 @@
+---
+version: 2
+project_name: tidyshare
+dist: .artifacts/release
+
+builds:
+  - main: ./cmd/tidyshare
+    binary: tidyshare
+    env:
+      - CGO_ENABLED=0
+    goos: [linux]
+    goarch: [amd64, arm64]
+    tags: [remote, exclude_graphdriver_btrfs, containers_image_openpgp]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version=v{{ .Version }} -X main.commit={{ .FullCommit }}
+
+archives:
+  - formats: [binary]
+    name_template: "{{ .ProjectName }}_v{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "{{ .ProjectName }}_v{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+changelog:
+  disable: true
+
+release:
+  disable: true
