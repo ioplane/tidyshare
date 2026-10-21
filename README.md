@@ -5,11 +5,13 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/ioplane/tidyshare/badge)](https://scorecard.dev/viewer/?uri=github.com/ioplane/tidyshare)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-Read-only scanner and reviewer for large file shares. It categorises files,
+Scanner and controlled cleanup tool for large file shares. It categorises files,
 finds byte-identical duplicates, ranks what is safe to remove, flags stale
 trees and matches container image archives against local podman storage. A
 separate `apply` step reclaims space from a reviewed duplicate plan without
-deleting files.
+deleting files. Explicit `cleanup` deletes reviewed redundant files or orphan
+Podman images, with dry run as the default. A local MCP server exposes these
+operations within configured filesystem and image-store boundaries.
 
 ## Features
 
@@ -26,6 +28,11 @@ deleting files.
   classic `yara` CLI.
 - **Apply** a reviewed plan: dry run by default; either move duplicates into a
   quarantine or share their extents with the kept copy (XFS reflink, Btrfs).
+- **Cleanup** reviewed duplicate files or unnamed orphan images: revalidate
+  every target and use `-yes` only after reviewing the dry-run report.
+- **Reports** in selectable JSON, JSONL and Markdown formats (`-formats`).
+- **MCP** over local stdio, scoped to an explicit root and image store;
+  deletion requires startup opt-in and an explicit tool request.
 
 ## Install
 
@@ -57,6 +64,16 @@ tidyshare apply -plan report/dups.tsv -mode dedupe -quarantine /srv/share/.tidys
 tidyshare apply -plan report/dups.tsv -mode dedupe -quarantine /srv/share/.tidyshare -limit 1 -yes
 ```
 
+Delete reviewed duplicate copies or prepare conservative image cleanup:
+
+```bash
+tidyshare cleanup -kind duplicates -plan report/dups.tsv -out ./cleanup-review -formats json,jsonl,md
+tidyshare cleanup -kind duplicates -plan report/dups.tsv -out ./cleanup-executed -formats json,jsonl,md -limit 1 -yes
+tidyshare images-plan -owner root -out ./image-review -formats json,jsonl,md
+tidyshare cleanup -kind images -plan image-review/image-plan.json -out ./image-cleanup -formats json,jsonl,md
+tidyshare mcp -root /srv/share -out /var/tmp/tidyshare-reports
+```
+
 ## Requirements
 
 - Linux. `scan` also reads from any tree the user can read.
@@ -67,12 +84,16 @@ tidyshare apply -plan report/dups.tsv -mode dedupe -quarantine /srv/share/.tidys
 
 ## Safety
 
-`scan` reads the selected files and writes reports only to `-out`, which is
-excluded from the scan. `apply` does nothing without
+`scan` reads the selected files, stages reports in a private temporary directory
+and publishes them to `-out`, which is excluded from the scan. `apply` does nothing without
 `-yes`, skips any file whose size or mtime changed after the scan, refuses to
 cross a filesystem boundary and never deletes a file. Use reviewed plans
 while the selected files and their parent directories are quiet. See
 [Design](docs/en/explanation/design.md).
+`cleanup` deletes only targets from the reviewed plan after revalidation.
+Keep source files, parent directories and the Podman store quiet during cleanup.
+Reports use new destinations and refuse existing files or symlink components.
+An image plan is not a backup; retain a verified recovery source before deletion.
 
 ## Documentation
 
@@ -80,6 +101,8 @@ while the selected files and their parent directories are quiet. See
 | --- | --- |
 | Scan a share | [docs/en/howto/scan-a-share.md](docs/en/howto/scan-a-share.md) |
 | Reclaim space | [docs/en/howto/reclaim-space.md](docs/en/howto/reclaim-space.md) |
+| Clean orphan images | [docs/en/howto/clean-images.md](docs/en/howto/clean-images.md) |
+| Use MCP | [docs/en/howto/use-mcp.md](docs/en/howto/use-mcp.md) |
 | Match container images | [docs/en/howto/match-container-images.md](docs/en/howto/match-container-images.md) |
 | Scan with YARA | [docs/en/howto/scan-with-yara.md](docs/en/howto/scan-with-yara.md) |
 | CLI reference | [docs/en/reference/cli.md](docs/en/reference/cli.md) |

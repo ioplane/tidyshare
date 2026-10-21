@@ -2,6 +2,35 @@
 
 Apply a reviewed `dups.tsv`. Dry run is the default.
 
+## Delete reviewed redundant copies
+
+Use `cleanup` when the redundant pathname and its content should be removed.
+`apply` continues to provide quarantine and extent sharing without deletion.
+
+```bash
+tidyshare cleanup -kind duplicates -plan report/dups.tsv -out ./dry-run -formats json,jsonl,md
+tidyshare cleanup -kind duplicates -plan report/dups.tsv -out ./canary -formats json,jsonl,md -limit 1 -yes
+```
+
+Review the `would_delete` results before supplying `-yes`. Each run needs fresh
+report destinations. Keepers are never deleted. Files must have a single link,
+be regular files on one filesystem, match the planned size and mtime, and compare
+byte-for-byte. Symlink components and unavailable advisory locks are refused.
+Metadata and identity are checked again before deletion; an already removed
+duplicate is reported as `absent` on retry.
+
+Deletion briefly claims the duplicate into a private `.tidyshare-delete-*`
+directory beside it, verifies the claimed inode and content, then unlinks it.
+On refusal after claiming, the original name is restored without replacement.
+If restoration fails, the command stops and identifies the retained path.
+After a crash or forced termination, inspect these directories and reports before
+retrying; there is no automatic crash recovery. Stop uncooperative writers and
+directory renames first: advisory locks do not freeze other processes.
+
+The report counts logical bytes removed, not unique filesystem blocks reclaimed.
+Reflinks, hardlinks outside the selected set, open file descriptors and parallel
+writes can make the filesystem free-space delta differ from this number.
+
 ## 1. Review the plan
 
 Open `dups.tsv`. Each group has one `keep` row and one or more `dup` rows.

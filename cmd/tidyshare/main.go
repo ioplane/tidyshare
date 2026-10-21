@@ -3,7 +3,8 @@
 // matches container image archives against local storage and ranks deletion
 // candidates. `apply` acts on a reviewed duplicate plan: it either moves the
 // duplicates into a same-filesystem quarantine or shares their extents with the
-// kept copy; nothing is deleted.
+// kept copy. `cleanup` explicitly deletes reviewed duplicate copies or orphan
+// images; all mutation commands default to dry run.
 package main
 
 import (
@@ -72,6 +73,7 @@ type opts struct {
 	workers, depth     int
 	skip               map[string]bool
 	imageUsers         string
+	formats            []string
 	imageSockets       map[string]string
 	images             bool
 	yaraRules, yaraBin string
@@ -90,6 +92,9 @@ const usage = `usage: tidyshare <command> [flags]
 commands:
   scan      read-only scan; writes reports to -out
   apply     act on a reviewed dups.tsv (dry run unless -yes)
+  images-plan  plan conservative orphan image cleanup
+  cleanup   delete reviewed duplicate files or orphan images (dry run unless -yes)
+  mcp       serve local MCP tools over stdio
   version   print version
 
 run "tidyshare <command> -h" for the flags of a command.
@@ -105,6 +110,14 @@ func main() {
 		os.Exit(runScan(os.Args[2:]))
 	case "apply":
 		os.Exit(runApply(os.Args[2:]))
+	case "cleanup":
+		os.Exit(runCleanup(os.Args[2:]))
+	case "images-plan":
+		os.Exit(runImagePlan(os.Args[2:]))
+	case "mcp":
+		if err := runMCP(os.Args[2:]); err != nil {
+			os.Exit(fail(err))
+		}
 	case "version", "-version", "--version":
 		fmt.Printf("tidyshare %s (%s)\n", version, commit)
 	case "help", "-h", "--help":
@@ -129,6 +142,7 @@ func runScan(args []string) int {
 	fs.BoolVar(&o.images, "images", true, "scan container images and match image archives")
 	engine := fs.String("engine", "podman", "deprecated: only podman is supported; inventory uses the Go SDK")
 	imageSockets := fs.String("image-sockets", "", "comma-separated owner=unix:///path API sockets for requested image stores")
+	formats := fs.String("formats", "json,jsonl,md", "comma-separated report formats: json,jsonl,md; TSV plans are always retained")
 	fs.StringVar(&o.imageUsers, "image-users", "", "comma-separated rootless users whose storage is also listed")
 	fs.StringVar(&o.yaraRules, "yara-rules", "", "YARA rules file or directory (empty = no YARA scan)")
 	fs.StringVar(&o.yaraBin, "yara-bin", "yara", "classic yara CLI (needs --scan-list)")
@@ -150,6 +164,10 @@ func runScan(args []string) int {
 		return fail(errors.New("-engine no longer executes binaries; use -image-sockets with the Podman API"))
 	}
 	var err error
+	o.formats, err = parseReportFormats(*formats)
+	if err != nil {
+		return fail(err)
+	}
 	o.imageSockets, err = parseImageSockets(*imageSockets, o.imageUsers)
 	if err != nil {
 		return fail(err)
@@ -175,9 +193,13 @@ func runScan(args []string) int {
 	if abs, err := filepath.Abs(o.out); err == nil {
 		o.skip[abs] = true
 	}
-	if err := os.MkdirAll(o.out, 0o755); err != nil {
+	reportOut := o.out
+	stage, err := os.MkdirTemp("", "tidyshare-reports-")
+	if err != nil {
 		return fail(err)
 	}
+	defer os.RemoveAll(stage)
+	o.out = stage
 	es, err := walk(o)
 	if err != nil {
 		return fail(err)
@@ -201,7 +223,10 @@ func runScan(args []string) int {
 	if err := writeCandidates(es, groups, ir, o); err != nil {
 		return fail(err)
 	}
-	fmt.Fprintf(os.Stderr, "reports in %s\n", o.out)
+	if err := publishScanReports(stage, reportOut, o.formats, o.root); err != nil {
+		return fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "reports in %s\n", reportOut)
 	return 0
 }
 
@@ -654,7 +679,7 @@ type row struct {
 }
 
 // readPlan validates every row before apply can create directories or move files.
-func readPlan(f *os.File) (map[string][]row, []string, error) {
+func readPlan(f io.Reader) (map[string][]row, []string, error) {
 	groups := map[string][]row{}
 	var order []string
 	seen := map[string]bool{}

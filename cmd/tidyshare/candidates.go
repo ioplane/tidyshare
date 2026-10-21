@@ -155,7 +155,7 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 	tw := bufio.NewWriter(tsv)
 	fmt.Fprintln(tw, "tier\tkind\tbytes\tfiles\tpath\tnote")
 	row := func(t int, kind string, b, n int64, p, note string) {
-		fmt.Fprintf(tw, "%d\t%s\t%d\t%d\t%s\t%s\n", t, kind, b, n, strconv.Quote(p), note)
+		fmt.Fprintf(tw, "%d\t%s\t%d\t%d\t%s\t%s\n", t, kind, b, n, strconv.Quote(p), strconv.Quote(note))
 	}
 	for _, g := range groups {
 		for _, e := range g[1:] {
@@ -195,7 +195,7 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 	defer md.Close()
 	w := bufio.NewWriter(md)
 	defer w.Flush()
-	fmt.Fprintf(w, "# Deletion candidates for %s\n\nNothing is deleted by the tool. Each file is counted once, in its lowest tier.\n\n| tier | meaning | files | size |\n|:---|:---|---:|---:|\n", o.root)
+	fmt.Fprintf(w, "# Deletion candidates for %s\n\nThis scan does not delete data. Each file is counted once, in its lowest tier.\n\n| tier | meaning | files | size |\n|:---|:---|---:|---:|\n", markdownCell(o.root))
 	for t := 1; t <= 3; t++ {
 		fmt.Fprintf(w, "| %d | %s | %d | %s |\n", t, []string{"", "safe: duplicate copy, junk", "review: image archive in storage, cache", fmt.Sprintf("decide: untouched %d d, regenerable output", o.staleDays)}[t], tierFiles[t], gib(tierBytes[t]))
 	}
@@ -205,7 +205,7 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 			if i == n {
 				break
 			}
-			fmt.Fprintf(w, "| %s | %d | %s | %s |\n", gib(dirs[d].bytes), dirs[d].files, d, note(d))
+			fmt.Fprintf(w, "| %s | %d | %s | %s |\n", gib(dirs[d].bytes), dirs[d].files, markdownCell(d), markdownCell(note(d)))
 		}
 	}
 	list("Tier 1: directories whose every file is a duplicate", redundant, 50, func(string) string { return "" })
@@ -214,7 +214,7 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 		if i == 50 {
 			break
 		}
-		fmt.Fprintf(w, "| %s | %d | %s |\n", gib(byDir[k].dupBytes), byDir[k].dupFiles, k)
+		fmt.Fprintf(w, "| %s | %d | %s |\n", gib(byDir[k].dupBytes), byDir[k].dupFiles, markdownCell(k))
 	}
 	fmt.Fprint(w, "\n## Tier 1: largest duplicate files (keeper in the note)\n\n| size | path | keep |\n|---:|:---|:---|\n")
 	n := 0
@@ -223,13 +223,13 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 			if n++; n > 40 {
 				break
 			}
-			fmt.Fprintf(w, "| %s | %s | %s |\n", gib(e.Size), e.Path, g[0].Path)
+			fmt.Fprintf(w, "| %s | %s | %s |\n", gib(e.Size), markdownCell(e.Path), markdownCell(g[0].Path))
 		}
 	}
 	fmt.Fprint(w, "\n## Tier 2: image archives already in container storage\n\n| size | path | stores | tags |\n|---:|:---|:---|:---|\n")
 	for _, a := range ir.Archives {
 		if a.Status == "in-store" {
-			fmt.Fprintf(w, "| %s | %s | %s | %s |\n", gib(a.Size), a.Path, strings.Join(a.Stores, ","), strings.Join(a.Tags, " "))
+			fmt.Fprintf(w, "| %s | %s | %s | %s |\n", gib(a.Size), markdownCell(a.Path), markdownCell(strings.Join(a.Stores, ",")), markdownCell(strings.Join(a.Tags, " ")))
 		}
 	}
 	var r2, r3 []string
