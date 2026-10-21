@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve image inventory and archive matches when optional Podman disk-usage
+  statistics are unavailable.
 - Preserve native Podman image names, distinguish untagged images, and keep
   unknown container counts out of the tagged-without-containers total.
 - Report unavailable image stores explicitly and prevent incomplete queries

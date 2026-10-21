@@ -43,6 +43,8 @@ unpacked.
 
 `images.md` also shows API disk-usage counts, dangling images and images
 without containers. Container commands are excluded from the summary.
+Disk-usage statistics are optional: a failed request marks only that summary
+as unavailable and preserves a successful image inventory and archive matches.
 
 ## Interpreting `in-store`
 

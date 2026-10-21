@@ -41,6 +41,10 @@ func imageAPI(t *testing.T, payload string, rootless bool, diskUsage ...string) 
 			fmt.Fprint(w, payload)
 		case strings.HasSuffix(r.URL.Path, "/libpod/system/df"):
 			if len(diskUsage) > 0 {
+				if diskUsage[0] == "" {
+					w.WriteHeader(http.StatusNotImplemented)
+					return
+				}
 				fmt.Fprint(w, diskUsage[0])
 				return
 			}
@@ -74,7 +78,7 @@ func TestPodmanSDKErrorsDoNotExposeResponseBodies(t *testing.T) {
 	endpoint := imageAPI(t, "[]", os.Geteuid() != 0, `{"ImagesSize":"bad","Containers":[{"Command":["password=fixture-private-value"]}]}`)
 	o := opts{out: t.TempDir(), imageUsers: u.Username, imageSockets: map[string]string{u.Username: endpoint}, workers: 1}
 	r := scanImages(nil, o)
-	if message := r.Unavailable[u.Username]; message == "" || strings.Contains(message, "fixture-private-value") {
+	if message := r.SystemDF[u.Username]; !strings.Contains(message, "disk usage: unavailable") || strings.Contains(message, "fixture-private-value") {
 		t.Fatalf("unsafe error diagnostic: %s", message)
 	}
 	if err := writeImages(r, o); err != nil {
@@ -86,6 +90,24 @@ func TestPodmanSDKErrorsDoNotExposeResponseBodies(t *testing.T) {
 	}
 	if strings.Contains(string(b), "fixture-private-value") {
 		t.Fatal("response body leaked to report")
+	}
+}
+
+func TestPodmanSDKPreservesInventoryWhenDiskUsageFails(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root inventory requires root")
+	}
+	id := strings.Repeat("ab", 32)
+	archive := filepath.Join(t.TempDir(), "image.tar")
+	tarOf(t, archive, [][2]string{{id + ".json", "{}"}, {"manifest.json", `[{"Config":"` + id + `.json"}]`}})
+	for name, df := range map[string]string{"unsupported": "", "malformed": "not-json"} {
+		t.Run(name, func(t *testing.T) {
+			endpoint := imageAPI(t, `[{"Id":"`+id+`","Containers":0}]`, false, df)
+			r := scanImages([]entry{{Path: archive, Size: 1 << 20, Mime: "application/x-tar"}}, opts{imageSockets: map[string]string{"root": endpoint}, workers: 1})
+			if len(r.Local) != 1 || len(r.Unavailable) != 0 || len(r.Archives) != 1 || r.Archives[0].Status != "in-store" || !strings.Contains(r.SystemDF["root"], "disk usage: unavailable") {
+				t.Fatalf("disk usage failure discarded inventory: %+v", r)
+			}
+		})
 	}
 }
 

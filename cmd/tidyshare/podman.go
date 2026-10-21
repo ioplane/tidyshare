@@ -181,14 +181,12 @@ func listLocal(endpoint, owner string) ([]localImage, string, error) {
 		}
 		imgs = append(imgs, localImage{ID: strings.TrimPrefix(x.ID, "sha256:"), Owner: owner, Tags: tags, Size: x.Size, Created: x.Created, Dangling: x.Dangling, Containers: counts[x.ID]})
 	}
+	summary := fmt.Sprintf("endpoint: %s\ngraphroot: %s\nrunroot: %s\n", endpoint, info.Store.GraphRoot, info.Store.RunRoot)
 	df, err := system.DiskUsage(conn, nil)
-	if err != nil {
-		return nil, "", &podmanAPIError{"disk usage", err}
-	}
-	if df == nil {
-		return nil, "", errors.New("podman API returned no disk usage")
+	if err != nil || df == nil {
+		return imgs, summary + fmt.Sprintf("images: %d\ndisk usage: unavailable\n", len(raw)), nil
 	}
 	// Summarise counts only; container commands can contain credentials.
-	summary := fmt.Sprintf("endpoint: %s\ngraphroot: %s\nrunroot: %s\nimages: %d; layer bytes: %d\ncontainers: %d\nvolumes: %d\n", endpoint, info.Store.GraphRoot, info.Store.RunRoot, len(raw), df.ImagesSize, len(df.Containers), len(df.Volumes))
+	summary += fmt.Sprintf("images: %d; layer bytes: %d\ncontainers: %d\nvolumes: %d\n", len(raw), df.ImagesSize, len(df.Containers), len(df.Volumes))
 	return imgs, summary, nil
 }
