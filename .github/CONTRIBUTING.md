@@ -1,8 +1,8 @@
 # Contributing to tidyshare
 
 tidyshare reads large file shares and, on request, rewrites file storage
-(`apply`) or deletes reviewed copies and images (`cleanup`). Changes are accepted when their safety effect is explicit, tested
-and reviewable.
+(`apply`) or deletes reviewed copies and images (`cleanup`). Changes are
+accepted when their safety effect is explicit, tested and reviewable.
 
 By participating, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md)
 and to license contributions under [Apache-2.0](../LICENSE).
@@ -53,8 +53,8 @@ podman compose run --rm vuln
 
 ## Testing expectations
 
-Behavior changes start with a failing test. Changes to `apply` or `cleanup` need tests for
-the refusal paths: a changed file, a different filesystem, a keeper that
+Behavior changes start with a failing test. Changes to `apply` or `cleanup`
+need tests for the refusal paths: a changed file, a different filesystem, a keeper that
 disappeared, content that differs. No test may touch paths outside a
 temporary directory.
 

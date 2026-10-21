@@ -84,8 +84,8 @@ tidyshare mcp -root /srv/share -out /var/tmp/tidyshare-reports
 
 ## Safety
 
-`scan` reads the selected files and writes reports only to `-out`, which is
-excluded from the scan. `apply` does nothing without
+`scan` reads the selected files, stages reports in a private temporary directory
+and publishes them to `-out`, which is excluded from the scan. `apply` does nothing without
 `-yes`, skips any file whose size or mtime changed after the scan, refuses to
 cross a filesystem boundary and never deletes a file. Use reviewed plans
 while the selected files and their parent directories are quiet. See
