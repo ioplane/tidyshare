@@ -36,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `discover` inventories known language caches and Git trees without source
+  hashing or executing repository configuration, and writes an exact cache plan.
+- `cleanup -kind caches` clears reviewed caches with identity, process-use,
+  mount and source-data checks. Maven local repositories are protected; Yarn
+  cache cleanup remains unsupported.
+- MCP `discover` and `cleanup_caches` use the existing root and execution gates.
 - `cleanup -kind duplicates` deletes reviewed byte-identical copies while
   preserving the keeper; `-yes` is required to execute instead of dry run.
 - `images-plan` and `cleanup -kind images` review and remove exact dangling

@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -41,6 +40,10 @@ type mcpScanInput struct {
 type mcpPlanInput struct {
 	Formats string `json:"formats,omitempty" jsonschema:"comma-separated json,jsonl,md; omitted means all three"`
 }
+type mcpDiscoverInput struct {
+	Path    string `json:"path,omitempty" jsonschema:"directory within the startup root; omitted means the root"`
+	Formats string `json:"formats,omitempty" jsonschema:"comma-separated json,jsonl,md; omitted means all three"`
+}
 type mcpCleanupInput struct {
 	PlanPath string `json:"plan_path" jsonschema:"reviewed plan within the startup root or report directory"`
 	Execute  bool   `json:"execute,omitempty" jsonschema:"perform cleanup; requires startup -allow-cleanup; false means dry run"`
@@ -57,7 +60,7 @@ type mcpOperationResult struct {
 func runMCP(args []string) error {
 	var o mcpOptions
 	flags := flag.NewFlagSet("mcp", flag.ContinueOnError)
-	flags.StringVar(&o.root, "root", "", "allowed scan and duplicate-cleanup root (required)")
+	flags.StringVar(&o.root, "root", "", "allowed discovery, scan and file/cache cleanup root (required)")
 	flags.StringVar(&o.out, "out", "", "private report parent directory (required)")
 	flags.BoolVar(&o.allowCleanup, "allow-cleanup", false, "allow tools to request cleanup explicitly")
 	flags.StringVar(&o.imageOwner, "image-owner", "root", "fixed owner of the Podman image store")
@@ -139,6 +142,14 @@ func (o *mcpOperations) server() *mcp.Server {
 	// Planning tools create private reports; annotations describe their additive effect.
 	planning := &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &nonDestructive, OpenWorldHint: &closed}
 	cleanup := &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &destructive, OpenWorldHint: &closed}
+	mcp.AddTool(server, &mcp.Tool{Name: "discover", Description: "Find language caches and Git trees inside the configured root and write a cache plan", Annotations: planning}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpDiscoverInput) (*mcp.CallToolResult, mcpOperationResult, error) {
+		path, err := o.dataDirectory(in.Path)
+		if err != nil {
+			return mcpReply(mcpOperationResult{}, err)
+		}
+		result, err := o.run(ctx, "discover", false, in.Formats, "-root", path)
+		return mcpReply(result, err)
+	})
 	mcp.AddTool(server, &mcp.Tool{Name: "scan", Description: "Scan an allowed directory read-only and write private reports and a duplicate plan", Annotations: planning}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpScanInput) (*mcp.CallToolResult, mcpOperationResult, error) {
 		result, err := o.scan(ctx, in)
 		return mcpReply(result, err)
@@ -147,7 +158,7 @@ func (o *mcpOperations) server() *mcp.Server {
 		result, err := o.planImages(ctx, in)
 		return mcpReply(result, err)
 	})
-	for _, kind := range []string{"duplicates", "images"} {
+	for _, kind := range []string{"duplicates", "images", "caches"} {
 		mcp.AddTool(server, &mcp.Tool{Name: "cleanup_" + kind, Description: "Validate a reviewed " + kind + " plan; dry run unless execute=true and startup permits cleanup", Annotations: cleanup}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpCleanupInput) (*mcp.CallToolResult, mcpOperationResult, error) {
 			result, err := o.cleanup(ctx, kind, in)
 			return mcpReply(result, err)
@@ -185,11 +196,10 @@ func (o *mcpOperations) anchors() error {
 	return nil
 }
 
-func (o *mcpOperations) scan(ctx context.Context, in mcpScanInput) (mcpOperationResult, error) {
+func (o *mcpOperations) dataDirectory(path string) (string, error) {
 	if err := o.anchors(); err != nil {
-		return mcpOperationResult{}, err
+		return "", err
 	}
-	path := in.Path
 	if path == "" {
 		path = o.options.root
 	}
@@ -197,11 +207,19 @@ func (o *mcpOperations) scan(ctx context.Context, in mcpScanInput) (mcpOperation
 		path = filepath.Join(o.options.root, path)
 	}
 	if filepath.Clean(path) != path || !mcpWithin(o.options.root, path) {
-		return mcpOperationResult{}, errors.New("scan path is outside the configured root")
+		return "", errors.New("data path is outside the configured root")
 	}
 	info, err := plainPath(path, false)
 	if err != nil || !info.IsDir() {
-		return mcpOperationResult{}, errors.New("scan path must be a directory without symlink components")
+		return "", errors.New("data path must be a directory without symlink components")
+	}
+	return path, nil
+}
+
+func (o *mcpOperations) scan(ctx context.Context, in mcpScanInput) (mcpOperationResult, error) {
+	path, err := o.dataDirectory(in.Path)
+	if err != nil {
+		return mcpOperationResult{}, err
 	}
 	if in.MinSize < 0 {
 		return mcpOperationResult{}, errors.New("min_size must be non-negative")
@@ -218,6 +236,9 @@ func (o *mcpOperations) planImages(ctx context.Context, in mcpPlanInput) (mcpOpe
 }
 
 func (o *mcpOperations) cleanup(ctx context.Context, kind string, in mcpCleanupInput) (mcpOperationResult, error) {
+	if kind != "duplicates" && kind != "images" && kind != "caches" {
+		return mcpOperationResult{}, errors.New("unsupported cleanup kind")
+	}
 	if in.Execute && !o.options.allowCleanup {
 		return mcpOperationResult{}, errors.New("cleanup execution is disabled; restart with -allow-cleanup after approval")
 	}
@@ -265,7 +286,8 @@ func (o *mcpOperations) cleanup(ctx context.Context, kind string, in mcpCleanupI
 	if err := reserved["reviewed-plan"].Sync(); err != nil {
 		return mcpOperationResult{}, errors.New("cannot sync reviewed plan")
 	}
-	if kind == "duplicates" {
+	switch kind {
+	case "duplicates":
 		groups, _, err := readPlan(bytes.NewReader(body))
 		if err != nil {
 			return mcpOperationResult{}, errors.New("invalid duplicate plan")
@@ -280,9 +302,28 @@ func (o *mcpOperations) cleanup(ctx context.Context, kind string, in mcpCleanupI
 				}
 			}
 		}
-	} else {
+	case "caches":
+		var plan cachePlan
+		if err := decodeStructuredPlan(body, &plan); err != nil {
+			return mcpOperationResult{}, errors.New("invalid cache plan")
+		}
+		if err := validateCachePlan(plan); err != nil || !mcpWithin(o.options.root, plan.Root) {
+			return mcpOperationResult{}, errors.New("cache plan is outside the configured data root or invalid")
+		}
+		for _, target := range plan.Targets {
+			if !mcpWithin(o.options.root, target.Path) || mcpWithin(o.options.out, target.Path) {
+				return mcpOperationResult{}, errors.New("cache target is outside the configured data root")
+			}
+			if _, err := plainPath(target.Path, true); err != nil {
+				return mcpOperationResult{}, errors.New("cache plan contains an unsafe target")
+			}
+		}
+		if err := cachePlanLocations(plan, path, o.options.out); err != nil {
+			return mcpOperationResult{}, err
+		}
+	default:
 		var plan imageCleanupPlan
-		if err := json.Unmarshal(body, &plan); err != nil || plan.Owner != o.options.imageOwner || plan.Endpoint != o.options.imageSocket {
+		if err := decodeStructuredPlan(body, &plan); err != nil || plan.Owner != o.options.imageOwner || plan.Endpoint != o.options.imageSocket {
 			return mcpOperationResult{}, errors.New("image plan does not match the configured owner and endpoint")
 		}
 		if err := validateImageCleanupPlan(plan); err != nil {
