@@ -22,15 +22,11 @@ type cleanupFile struct {
 }
 
 func openCleanupFile(r row) (*cleanupFile, error) {
-	pfd, err := unix.Openat2(unix.AT_FDCWD, filepath.Dir(r.path), &unix.OpenHow{
-		Flags:   unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC,
-		Resolve: unix.RESOLVE_NO_SYMLINKS,
-	})
+	parent, err := openPlainDirectory(filepath.Dir(r.path), false)
 	if err != nil {
 		return nil, err
 	}
-	parent := os.NewFile(uintptr(pfd), filepath.Dir(r.path))
-	fd, err := unix.Openat(pfd, filepath.Base(r.path), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	fd, err := unix.Openat(int(parent.Fd()), filepath.Base(r.path), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
 	if err != nil {
 		_ = parent.Close()
 		return nil, err

@@ -3,11 +3,15 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestReportFormats(t *testing.T) {
@@ -19,6 +23,30 @@ func TestReportFormats(t *testing.T) {
 	got, err := parseReportFormats(" json,md,jsonl,json ")
 	if err != nil || !reflect.DeepEqual(got, []string{"json", "md", "jsonl"}) {
 		t.Fatalf("formats=%v err=%v", got, err)
+	}
+}
+
+func TestOpenPlainDirectoryDoesNotCreateReadOnlyPaths(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "child")
+	if dir, err := openPlainDirectory(path, false); err == nil {
+		dir.Close()
+		t.Fatal("missing read-only directory accepted")
+	}
+	if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) {
+		t.Fatalf("read-only open created a directory: %v", err)
+	}
+	dir, err := openPlainDirectory(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir.Close()
+	alias := filepath.Join(t.TempDir(), "alias")
+	if err := os.Symlink(filepath.Dir(path), alias); err != nil {
+		t.Fatal(err)
+	}
+	if dir, err := openPlainDirectory(filepath.Join(alias, "child"), false); err == nil {
+		dir.Close()
+		t.Fatal("directory symlink accepted")
 	}
 }
 
@@ -232,6 +260,9 @@ func TestScanStructuredRecordsPreservePlanAndCatalog(t *testing.T) {
 	if err := dec.Decode(&summary); err != nil || summary.Type != "summary" {
 		t.Fatalf("summary=%+v err=%v", summary, err)
 	}
+	if summary.Data["records"] != float64(len(report.Records)) {
+		t.Fatalf("summary count=%v actual=%d", summary.Data["records"], len(report.Records))
+	}
 	for i, want := range report.Records {
 		var got scanRecord
 		if err := dec.Decode(&got); err != nil || !reflect.DeepEqual(got, want) {
@@ -245,7 +276,11 @@ func TestCatalogReportPreservesLargeIntegers(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{\"path\":\"/share/large\",\"size\":9007199254740993}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := readScanRecords(path, "catalog")
+	var rows []scanRecord
+	err := forEachScanRecord(path, "catalog", func(record scanRecord) error {
+		rows = append(rows, record)
+		return nil
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,4 +288,128 @@ func TestCatalogReportPreservesLargeIntegers(t *testing.T) {
 	if err != nil || !strings.Contains(string(b), `"size":9007199254740993`) {
 		t.Fatalf("rows=%s err=%v", b, err)
 	}
+}
+
+func TestScanCandidateKeeperControlCharacters(t *testing.T) {
+	for character, escaped := range map[string]string{"\t": "\\t", "\n": "\\n", "|": "\\|"} {
+		t.Run(fmt.Sprintf("%q", character), func(t *testing.T) {
+			root, out := t.TempDir(), t.TempDir()
+			keeper := filepath.Join(root, "a"+character+"keeper.txt")
+			write(t, keeper, "same bytes", 48*time.Hour)
+			write(t, filepath.Join(root, "z copy.txt"), "same bytes", 48*time.Hour)
+			if rc := runScan([]string{"-root", root, "-out", out, "-images=false", "-min-size", "1", "-settle", "0"}); rc != 0 {
+				t.Fatalf("default scan rc=%d", rc)
+			}
+			md, err := os.ReadFile(filepath.Join(out, "candidates.md"))
+			if err != nil || !strings.Contains(string(md), root+"/a"+escaped+"keeper.txt") {
+				t.Fatalf("escaped keeper missing from Markdown: %q err=%v", md, err)
+			}
+			body, err := os.ReadFile(filepath.Join(out, "report.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var report struct {
+				Records []scanRecord `json:"records"`
+			}
+			if err := json.Unmarshal(body, &report); err != nil {
+				t.Fatal(err)
+			}
+			for _, record := range report.Records {
+				if record.Type == "candidates" && record.Data["kind"] == "dup-file" {
+					if record.Data["note"] != "keep: "+keeper {
+						t.Fatalf("note=%q keeper=%q", record.Data["note"], keeper)
+					}
+					return
+				}
+			}
+			t.Fatal("duplicate candidate missing")
+		})
+	}
+}
+
+func BenchmarkPublishScanReports(b *testing.B) {
+	stage := b.TempDir()
+	f, err := os.Create(filepath.Join(stage, "catalog.jsonl"))
+	if err != nil {
+		b.Fatal(err)
+	}
+	w := bufio.NewWriter(f)
+	for i := range 30000 {
+		fmt.Fprintf(w, "{\"path\":\"/share/file-%06d\",\"area\":\"share\",\"category\":\"data\",\"mime\":\"text/plain\",\"size\":1024,\"mtime\":10,\"atime\":11,\"stale\":\"\"}\n", i)
+	}
+	if err := w.Flush(); err != nil {
+		b.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		b.Fatal(err)
+	}
+	base := b.TempDir()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := range b.N {
+		if err := publishScanReports(stage, filepath.Join(base, fmt.Sprint(i)), []string{"json", "jsonl"}, "/share"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestScanRecordStreamingStopsBeforeInvalidTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.jsonl")
+	if err := os.WriteFile(path, []byte("{\"path\":\"/share/first\"}\nnot-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stop := errors.New("consumer stopped")
+	var count int
+	err := forEachScanRecord(path, "catalog", func(record scanRecord) error {
+		count++
+		if record.Data["path"] != "/share/first" {
+			t.Fatalf("record=%+v", record)
+		}
+		return stop
+	})
+	if !errors.Is(err, stop) || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestScanRecordStreamingRetainsBoundedMemory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "catalog.jsonl")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := bufio.NewWriter(f)
+	for i := range 30000 {
+		fmt.Fprintf(w, "{\"path\":\"/share/file-%06d\",\"category\":\"data\",\"size\":1024}\n", i)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	var baseline runtime.MemStats
+	runtime.ReadMemStats(&baseline)
+	count := 0
+	var peak uint64
+	err = forEachScanRecord(path, "catalog", func(scanRecord) error {
+		count++
+		if count%5000 == 0 {
+			runtime.GC()
+			var current runtime.MemStats
+			runtime.ReadMemStats(&current)
+			if current.HeapAlloc > baseline.HeapAlloc {
+				peak = max(peak, current.HeapAlloc-baseline.HeapAlloc)
+			}
+			if current.HeapAlloc > baseline.HeapAlloc+4<<20 {
+				t.Fatalf("retained heap grew by %d bytes after %d records", current.HeapAlloc-baseline.HeapAlloc, count)
+			}
+		}
+		return nil
+	})
+	if err != nil || count != 30000 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+	t.Logf("records=%d peak retained heap growth=%d bytes", count, peak)
 }

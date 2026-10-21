@@ -19,7 +19,7 @@ every directory component. New directories use mode `0700`; reports use `0600`.
 | `images.md`, `images.tsv` | podman images and archive matching (with `-images`) |
 | `yara.tsv`, `yara.list`, `yara.err`, `yara-index.yar` | YARA results and inputs (with `-yara-rules`) |
 
-Paths in TSV files are Go-quoted strings.
+Paths in TSV files and the candidate `note` column are Go-quoted strings.
 
 ## Structured scan reports
 
@@ -29,6 +29,8 @@ Types are `catalog`, `dups`, `stale`, `candidates`, `images`, and `yara` when
 their source table is present. Catalog fields retain JSON numbers; TSV fields
 are strings, with Go-quoted values decoded. The machine formats include every
 table row rather than the largest-row limits of Markdown summaries.
+Publication counts and validates staged rows first, then streams records into
+the selected machine reports without retaining the complete record set.
 
 `report.jsonl` starts with a `summary` record whose `data` contains `operation`,
 `root`, and the number of following records. Subsequent records have the same

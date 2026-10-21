@@ -49,9 +49,13 @@ func parseReportFormats(value string) ([]string, error) {
 	return formats, nil
 }
 
-// openReportDirectory pins every directory component without following symlinks.
 func openReportDirectory(out string) (*os.File, error) {
-	abs, err := filepath.Abs(out)
+	return openPlainDirectory(out, true)
+}
+
+// openPlainDirectory pins every directory component without following symlinks.
+func openPlainDirectory(path string, create bool) (*os.File, error) {
+	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
@@ -64,16 +68,16 @@ func openReportDirectory(out string) (*os.File, error) {
 			continue
 		}
 		next, openErr := unix.Openat(fd, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-		if errors.Is(openErr, unix.ENOENT) {
+		if create && errors.Is(openErr, unix.ENOENT) {
 			if mkdirErr := unix.Mkdirat(fd, component, 0o700); mkdirErr != nil && !errors.Is(mkdirErr, unix.EEXIST) {
 				_ = unix.Close(fd)
-				return nil, fmt.Errorf("create report directory: %w", mkdirErr)
+				return nil, fmt.Errorf("create plain directory: %w", mkdirErr)
 			}
 			next, openErr = unix.Openat(fd, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		}
 		_ = unix.Close(fd)
 		if openErr != nil {
-			return nil, fmt.Errorf("open report directory without symlinks: %w", openErr)
+			return nil, fmt.Errorf("open directory without symlinks: %w", openErr)
 		}
 		fd = next
 	}
@@ -207,6 +211,7 @@ func markdownCell(value string) string {
 	value = strings.ReplaceAll(value, "\\", "\\\\")
 	value = strings.ReplaceAll(value, "|", "\\|")
 	value = strings.ReplaceAll(value, "\r", "\\r")
+	value = strings.ReplaceAll(value, "\t", "\\t")
 	value = strings.ReplaceAll(value, "\n", "\\n")
 	value = strings.ReplaceAll(value, "<", "&lt;")
 	return strings.ReplaceAll(value, ">", "&gt;")
@@ -229,7 +234,8 @@ func publishScanReports(stage, out string, formats []string, root string) error 
 		return err
 	}
 	var names []string
-	var records []scanRecord
+	var sources []string
+	recordCount := 0
 	for _, file := range entries {
 		name := file.Name()
 		ext := strings.TrimPrefix(filepath.Ext(name), ".")
@@ -237,11 +243,12 @@ func publishScanReports(stage, out string, formats []string, root string) error 
 			names = append(names, name)
 		}
 		if (selected["json"] || selected["jsonl"]) && (ext == "tsv" || name == "catalog.jsonl") {
-			rows, err := readScanRecords(filepath.Join(stage, name), strings.TrimSuffix(name, filepath.Ext(name)))
+			count, err := countScanRecords(filepath.Join(stage, name))
 			if err != nil {
 				return err
 			}
-			records = append(records, rows...)
+			recordCount += count
+			sources = append(sources, name)
 		}
 	}
 	for _, format := range []string{"json", "jsonl"} {
@@ -256,35 +263,23 @@ func publishScanReports(stage, out string, formats []string, root string) error 
 	defer closeFiles()
 	for _, name := range names {
 		f := files[name]
-		switch name {
-		case "report.json":
-			err = json.NewEncoder(f).Encode(struct {
-				SchemaVersion int          `json:"schema_version"`
-				Operation     string       `json:"operation"`
-				Root          string       `json:"root"`
-				Records       []scanRecord `json:"records"`
-			}{1, "scan", root, records})
-		case "report.jsonl":
-			enc := json.NewEncoder(f)
-			err = enc.Encode(scanRecord{1, "summary", map[string]any{"operation": "scan", "root": root, "records": len(records)}})
-			if err == nil {
-				for _, record := range records {
-					if err = enc.Encode(record); err != nil {
-						break
-					}
-				}
-			}
-		default:
-			var src *os.File
-			src, err = os.Open(filepath.Join(stage, name))
-			if err == nil {
-				_, err = io.Copy(f, src)
-				err = errors.Join(err, src.Close())
-			}
+		if name == "report.json" || name == "report.jsonl" {
+			continue
 		}
+		src, err := os.Open(filepath.Join(stage, name))
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(f, src)
+		err = errors.Join(err, src.Close())
 		if err != nil {
 			return fmt.Errorf("publish scan report: %w", err)
 		}
+	}
+	if err := writeScanMachineReports(stage, root, sources, recordCount, files); err != nil {
+		return fmt.Errorf("publish scan report: %w", err)
+	}
+	for _, f := range files {
 		if err := f.Sync(); err != nil {
 			return err
 		}
@@ -292,13 +287,90 @@ func publishScanReports(stage, out string, formats []string, root string) error 
 	return nil
 }
 
-func readScanRecords(path, kind string) ([]scanRecord, error) {
+func countScanRecords(path string) (int, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	defer f.Close()
-	var records []scanRecord
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 4096), 1<<20)
+	catalog := filepath.Ext(path) == ".jsonl"
+	columns := 0
+	if !catalog && sc.Scan() {
+		columns = strings.Count(sc.Text(), "\t")
+	}
+	count := 0
+	for sc.Scan() {
+		if (catalog && !json.Valid(sc.Bytes())) || (!catalog && strings.Count(sc.Text(), "\t") != columns) {
+			return 0, fmt.Errorf("invalid staged report row in %s", filepath.Base(path))
+		}
+		count++
+	}
+	return count, sc.Err()
+}
+
+func writeScanMachineReports(stage, root string, sources []string, count int, files map[string]*os.File) error {
+	var jsonWriter, jsonlWriter *bufio.Writer
+	var jsonEncoder, jsonlEncoder *json.Encoder
+	if file := files["report.json"]; file != nil {
+		jsonWriter = bufio.NewWriter(file)
+		jsonEncoder = json.NewEncoder(jsonWriter)
+		rootJSON, err := json.Marshal(root)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(jsonWriter, "{\"schema_version\":1,\"operation\":\"scan\",\"root\":%s,\"records\":[", rootJSON)
+	}
+	if file := files["report.jsonl"]; file != nil {
+		jsonlWriter = bufio.NewWriter(file)
+		jsonlEncoder = json.NewEncoder(jsonlWriter)
+		if err := jsonlEncoder.Encode(scanRecord{1, "summary", map[string]any{"operation": "scan", "root": root, "records": count}}); err != nil {
+			return err
+		}
+	}
+	first := true
+	for _, source := range sources {
+		if err := forEachScanRecord(filepath.Join(stage, source), strings.TrimSuffix(source, filepath.Ext(source)), func(record scanRecord) error {
+			if jsonEncoder != nil {
+				if !first {
+					if err := jsonWriter.WriteByte(','); err != nil {
+						return err
+					}
+				}
+				if err := jsonEncoder.Encode(record); err != nil {
+					return err
+				}
+			}
+			first = false
+			if jsonlEncoder != nil {
+				return jsonlEncoder.Encode(record)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	if jsonWriter != nil {
+		if _, err := jsonWriter.WriteString("]}\n"); err != nil {
+			return err
+		}
+		if err := jsonWriter.Flush(); err != nil {
+			return err
+		}
+	}
+	if jsonlWriter != nil {
+		return jsonlWriter.Flush()
+	}
+	return nil
+}
+
+func forEachScanRecord(path, kind string, consume func(scanRecord) error) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
 	if kind == "catalog" {
 		dec := json.NewDecoder(f)
 		dec.UseNumber()
@@ -306,23 +378,25 @@ func readScanRecords(path, kind string) ([]scanRecord, error) {
 			var data map[string]any
 			if err := dec.Decode(&data); err != nil {
 				if errors.Is(err, io.EOF) {
-					return records, nil
+					return nil
 				}
-				return nil, err
+				return err
 			}
-			records = append(records, scanRecord{1, kind, data})
+			if err := consume(scanRecord{1, kind, data}); err != nil {
+				return err
+			}
 		}
 	}
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 4096), 1<<20)
 	if !sc.Scan() {
-		return records, sc.Err()
+		return sc.Err()
 	}
 	columns := strings.Split(sc.Text(), "\t")
 	for sc.Scan() {
 		values := strings.Split(sc.Text(), "\t")
 		if len(values) != len(columns) {
-			return nil, fmt.Errorf("invalid staged report row in %s", filepath.Base(path))
+			return fmt.Errorf("invalid staged report row in %s", filepath.Base(path))
 		}
 		data := make(map[string]any, len(columns))
 		for i, column := range columns {
@@ -332,7 +406,9 @@ func readScanRecords(path, kind string) ([]scanRecord, error) {
 			}
 			data[column] = value
 		}
-		records = append(records, scanRecord{1, kind, data})
+		if err := consume(scanRecord{1, kind, data}); err != nil {
+			return err
+		}
 	}
-	return records, sc.Err()
+	return sc.Err()
 }

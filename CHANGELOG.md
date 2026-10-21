@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Report publication refuses existing output files instead of replacing them.
   Use a new output directory for each run (breaking change).
+- Candidate TSV notes use Go string quoting, like path cells, so control
+  characters do not corrupt rows (breaking change for raw TSV readers).
 - Query Podman through the official Go SDK and accept explicit owner-bound
   Unix sockets with `-image-sockets`, including nonstandard rootless runtimes.
   Scanning never starts or recovers an API service. The deprecated `-engine`
