@@ -27,7 +27,7 @@ duplicate detection, because they may still be written.
 
 ```bash
 tidyshare scan -root /srv/share -out ./report \
-  -min-size 4194304 -stale-days 365 -skip /srv/share/.cache,/srv/share/tmp
+  -images=false -min-size 4194304 -stale-days 365 -skip /srv/share/.cache,/srv/share/tmp
 ```
 
 Duplicate detection groups eligible files by size before reading samples.
