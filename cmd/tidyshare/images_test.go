@@ -2,68 +2,25 @@ package main
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 )
 
-func imageEngine(t *testing.T, payload string) string {
-	t.Helper()
-	p := filepath.Join(t.TempDir(), "engine")
-	script := "#!/bin/sh\nif [ \"$1\" = images ]; then\ncat <<'JSON'\n" + payload + "\nJSON\nelse\nprintf 'fixture df\\n'\nfi\n"
-	if err := os.WriteFile(p, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
-func TestRootlessRuntimeValidation(t *testing.T) {
-	uid := strconv.Itoa(os.Getuid())
-	private := t.TempDir()
-	if err := os.Chmod(private, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateRuntimeDir(private, uid); err != nil {
-		t.Fatal(err)
-	}
-	missing := filepath.Join(t.TempDir(), "missing")
-	if err := validateRuntimeDir(missing, uid); err == nil {
-		t.Fatal("missing runtime accepted")
-	}
-	if _, err := os.Stat(missing); !os.IsNotExist(err) {
-		t.Fatal("runtime created")
-	}
-	link := filepath.Join(t.TempDir(), "link")
-	if err := os.Symlink(private, link); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateRuntimeDir(link, uid); err == nil {
-		t.Fatal("symlink runtime accepted")
-	}
-	if err := os.Chmod(private, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateRuntimeDir(private, uid); err == nil {
-		t.Fatal("public runtime accepted")
-	}
-	if err := os.Chmod(private, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := validateRuntimeDir(private, strconv.Itoa(os.Getuid()+1)); err == nil {
-		t.Fatal("wrong owner accepted")
-	}
-}
-
 func TestLocalImageNames(t *testing.T) {
-	engine := imageEngine(t, `[
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	endpoint := imageAPI(t, `[
  {"Id":"sha256:aa","Names":["example.invalid/native:v1"],"Containers":0},
  {"Id":"bb","RepoTags":["example.invalid/compat:v2"],"Containers":1},
  {"Id":"cc","Names":["<none>","<none>:<none>",""],"Dangling":false},
  {"Id":"dd","Names":["example.invalid/unknown:v3"]},
  {"Id":"ee","Names":["<none>"],"RepoTags":["example.invalid/fallback:v4"]}
- ]`)
-	imgs, _, err := listLocal(engine, "root")
+ ]`, os.Geteuid() != 0)
+	imgs, _, err := listLocal(endpoint, u.Username)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +42,7 @@ func TestUnprivilegedRootStoreIsUnavailable(t *testing.T) {
 }
 
 func TestImageReportDoesNotCallUntaggedTagged(t *testing.T) {
-	o := opts{out: t.TempDir(), engine: "podman"}
+	o := opts{out: t.TempDir()}
 	r := imageReport{Local: []localImage{
 		{ID: "aa", Tags: []string{"example.invalid/a:v1"}, Containers: 0},
 		{ID: "bb", Containers: 0},
@@ -104,10 +61,13 @@ func TestImageReportDoesNotCallUntaggedTagged(t *testing.T) {
 }
 
 func TestIncompleteStoresDoNotProveArchiveAbsent(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("root inventory requires root")
+	}
 	id := strings.Repeat("ab", 32)
 	archive := filepath.Join(t.TempDir(), "image.tar")
 	tarOf(t, archive, [][2]string{{id + ".json", "{}"}, {"manifest.json", `[{"Config":"` + id + `.json"}]`}})
-	o := opts{out: t.TempDir(), engine: imageEngine(t, "[]"), imageUsers: "tidyshare-no-such-test-account", workers: 2}
+	o := opts{out: t.TempDir(), imageSockets: map[string]string{"root": imageAPI(t, "[]", false)}, imageUsers: "tidyshare-no-such-test-account", workers: 2}
 	r := scanImages([]entry{{Path: archive, Size: 1 << 20, Mime: "application/x-tar"}}, o)
 	if len(r.Archives) != 1 || r.Archives[0].Status != "unknown" {
 		t.Fatalf("failed store treated as absent: %+v", r.Archives)
