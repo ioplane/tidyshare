@@ -93,8 +93,8 @@ See [MCP](../howto/use-mcp.md) for tool inputs and client configuration.
 
 | Code | Meaning |
 | --- | --- |
-| 0 | completed |
-| 1 | error (bad flags, unreadable plan, report write failure) |
+| 0 | operation completed; inspect reports for skipped targets and unavailable optional stores |
+| 1 | error or incomplete discovery (bad flags, unreadable plan, report write failure or inventory warnings) |
 | 2 | unknown command |
 
 `scan` accepts a real directory as `-root` and normalizes it to an absolute
