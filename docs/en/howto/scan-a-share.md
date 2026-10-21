@@ -3,11 +3,13 @@
 Run a read-only scan and read the reports.
 
 ```bash
-tidyshare scan -root /srv/share -out /var/tmp/tidyshare-report
+tidyshare scan -root /srv/share -out /var/tmp/tidyshare-report -images=false
 ```
 
 Keep `-out` on a different filesystem when the share is nearly full. Reports
 list every file path: store them like the data they describe.
+This file-only scan does not query Podman. Enable `-images` when a local API
+service is available; see [Match container images](match-container-images.md).
 
 The scan skips files modified within `-settle` (default one hour) for
 duplicate detection, because they may still be written.
@@ -28,5 +30,7 @@ tidyshare scan -root /srv/share -out ./report \
   -min-size 4194304 -stale-days 365 -skip /srv/share/.cache,/srv/share/tmp
 ```
 
-The scan hashes only files that share a size with another file, so a tree with
-few duplicates is read once for metadata and for the first and last 64 KiB.
+Duplicate detection groups eligible files by size before reading samples.
+Files with unique sizes receive no duplicate hash. Equal-size candidates are
+sampled at the first and last 64 KiB; only groups with equal samples receive
+a full-file hash. MIME detection remains a separate content read.

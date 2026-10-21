@@ -38,28 +38,30 @@ operations within configured filesystem and image-store boundaries.
 
 ## Install
 
-Download a release binary, verify it, and put it on `PATH`:
-
-Use a release tag (including its `v` prefix) for `<version>`. The
-[release process](docs/en/explanation/releases.md) also provides Actions
-snapshots for verification before publication.
+Download [v0.1.0](https://github.com/ioplane/tidyshare/releases/tag/v0.1.0),
+verify it, and put the binary on `PATH`. Static Linux amd64 and arm64
+executables are available; neither requires CGO or a local Podman installation
+for file-only operations.
 
 ```bash
-sha256sum --check tidyshare_<version>_checksums.txt
-gh attestation verify tidyshare_<version>_linux_amd64 --repo ioplane/tidyshare
-install -m 0755 tidyshare_<version>_linux_amd64 /usr/local/bin/tidyshare
+gh release download v0.1.0 --repo ioplane/tidyshare
+sha256sum --check tidyshare_v0.1.0_checksums.txt
+gh attestation verify tidyshare_v0.1.0_linux_amd64 --repo ioplane/tidyshare
+install -m 0755 tidyshare_v0.1.0_linux_amd64 /usr/local/bin/tidyshare
 ```
 
-Or build from source with Go:
+Use the `linux_arm64` asset on ARM64 systems. See the
+[release process](docs/en/explanation/releases.md) for provenance verification
+and Actions snapshots. Or build this release from source with Go:
 
 ```bash
-go install -tags remote,exclude_graphdriver_btrfs,containers_image_openpgp github.com/ioplane/tidyshare/cmd/tidyshare@latest
+CGO_ENABLED=0 go install -tags remote,exclude_graphdriver_btrfs,containers_image_openpgp github.com/ioplane/tidyshare/cmd/tidyshare@v0.1.0
 ```
 
 ## Quick start
 
 ```bash
-tidyshare scan -root /srv/share -out ./report
+tidyshare scan -root /srv/share -out ./report -images=false
 less report/report.md report/candidates.md
 ```
 
@@ -126,6 +128,7 @@ An image plan is not a backup; retain a verified recovery source before deletion
 | CLI reference | [docs/en/reference/cli.md](docs/en/reference/cli.md) |
 | Report files | [docs/en/reference/reports.md](docs/en/reference/reports.md) |
 | Design and limits | [docs/en/explanation/design.md](docs/en/explanation/design.md) |
+| Releases and artifact verification | [docs/en/explanation/releases.md](docs/en/explanation/releases.md) |
 
 ## Project
 
