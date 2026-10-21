@@ -40,6 +40,10 @@ operations within configured filesystem and image-store boundaries.
 
 Download a release binary, verify it, and put it on `PATH`:
 
+Use a release tag (including its `v` prefix) for `<version>`. The
+[release process](docs/en/explanation/releases.md) also provides Actions
+snapshots for verification before publication.
+
 ```bash
 sha256sum --check tidyshare_<version>_checksums.txt
 gh attestation verify tidyshare_<version>_linux_amd64 --repo ioplane/tidyshare
