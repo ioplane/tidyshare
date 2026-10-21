@@ -122,3 +122,17 @@ func TestDiscoveryBareRepositoryAtCachePath(t *testing.T) {
 		t.Fatalf("wrong bare repository inventory: %+v", report.GitTrees)
 	}
 }
+
+func TestDiscoveryRefusesReportsInsideCache(t *testing.T) {
+	p := cacheFixture(t, ".cargo/registry/cache", "index/payload.crate")
+	out := filepath.Join(p.Targets[0].Path, "review")
+	if code := runDiscover([]string{"-root", p.Root, "-out", out}); code == 0 {
+		t.Fatal("discovery published an unusable plan inside its cleanup target")
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("discovery created output before location validation: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(p.Targets[0].Path, "index/payload.crate")); err != nil {
+		t.Fatal("discovery changed cache payload", err)
+	}
+}

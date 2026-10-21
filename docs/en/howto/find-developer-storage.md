@@ -12,6 +12,8 @@ eligibility. It also lists Git trees with their branch, available HEAD, lock,
 missing and prunable indicators. JSON and JSONL contain the same records.
 `cache-plan.json` contains only cache kinds with an implemented cleanup policy.
 Review it and remove unwanted `targets` entries before cleanup.
+The output directory must remain outside these cache targets; discovery
+rejects an overlapping destination before creating report files.
 
 The directory walk does not follow symlinks. It skips its output directory,
 recognized cache payload trees and Git administrative directories. Git clones

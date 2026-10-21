@@ -51,7 +51,10 @@ its recorded device, inode and owner. Cleanup refuses symlink path components,
 nested mounts (including bind mounts), open files, process working directories
 and mapped payloads. Raw process symlink paths remain literal; escaped proc
 text paths are decoded separately, preserving literal backslashes and names
-ending in ` (deleted)`. An uninspectable process prevents cleanup. Direct cleanup
+ending in ` (deleted)`. An uninspectable process prevents cleanup. On shared
+hosts, an unprivileged account may need elevated process-inspection privileges;
+an inaccessible process can still use an owner-private cache. Review skipped
+results instead of treating them as empty or safe caches. Direct cleanup
 refuses symlinks, special files, hardlinked payloads, source files, Git metadata
 and configuration, and preserves the cache root. Bare Git repositories are
 recognized through pinned, non-following `HEAD`/`objects`/`refs` metadata checks

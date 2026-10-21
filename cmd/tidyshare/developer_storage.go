@@ -152,6 +152,9 @@ func writeDiscoveryReports(out string, formats []string, report discoveryReport)
 	if err := validateCachePlan(plan); err != nil {
 		return err
 	}
+	if err := cachePlanLocations(plan, filepath.Join(out, "cache-plan.json"), out); err != nil {
+		return err
+	}
 	names := []string{"cache-plan.json"}
 	for _, format := range formats {
 		names = append(names, "discovery."+format)
