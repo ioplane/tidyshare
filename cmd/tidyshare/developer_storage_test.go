@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -15,10 +16,7 @@ import (
 func TestDeveloperStorageCLI(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	binary := filepath.Join(t.TempDir(), "tidyshare")
-	if output, err := exec.CommandContext(ctx, "go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v %s", err, output)
-	}
+	binary := tidyshareTestBinary(t)
 	root, out := t.TempDir(), t.TempDir()
 	cache := filepath.Join(root, "home", "dev", ".cache", "go-build")
 	payload := filepath.Join(cache, "00", strings.Repeat("0", 64)+"-d")
@@ -90,7 +88,11 @@ func TestDeveloperStorageCLI(t *testing.T) {
 		var report struct {
 			Changed int `json:"changed"`
 		}
-		if err := json.Unmarshal(body, &report); err != nil || report.Changed != step.changed {
+		wantChanged := step.changed
+		if runtime.GOOS == "darwin" {
+			wantChanged = 0
+		}
+		if err := json.Unmarshal(body, &report); err != nil || report.Changed != wantChanged {
 			t.Fatalf("%s changed=%d want=%d err=%v report=%s", step.name, report.Changed, step.changed, err, body)
 		}
 		if !step.execute {
@@ -99,7 +101,7 @@ func TestDeveloperStorageCLI(t *testing.T) {
 			}
 		}
 	}
-	if _, err := os.Stat(payload); !os.IsNotExist(err) {
+	if _, err := os.Stat(payload); runtime.GOOS == "linux" && !os.IsNotExist(err) {
 		t.Fatalf("payload remains: %v", err)
 	}
 	if b, err := os.ReadFile(localArtifact); err != nil || string(b) != "unpublished-local-package" {

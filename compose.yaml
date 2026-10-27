@@ -13,7 +13,7 @@ x-verification-service: &verification-service
     HOME: /tmp/home
     XDG_CACHE_HOME: /tmp/cache
   tmpfs:
-    - /tmp:rw,nosuid,nodev,size=2g
+    - /tmp:rw,exec,nosuid,nodev,size=2g
   volumes:
     - .:/workspace:ro
 

@@ -26,7 +26,7 @@ import (
 func socketPath(endpoint string) (string, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return "", fmt.Errorf("invalid Podman endpoint: %w", err)
+		return "", errors.New("invalid Podman endpoint")
 	}
 	if u.Scheme != "unix" || u.Host != "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || !filepath.IsAbs(u.Path) || filepath.Clean(u.Path) != u.Path || strings.ContainsAny(u.Path, "\x00\r\n") {
 		return "", errors.New("podman endpoint must be a local Unix socket URI without credentials, query or fragment")

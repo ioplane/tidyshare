@@ -23,6 +23,10 @@ type cleanupResult struct {
 	Bytes  int64  `json:"bytes,omitempty"`
 }
 
+func finishReport(buffer *bufio.Writer, file io.Closer) error {
+	return errors.Join(buffer.Flush(), file.Close())
+}
+
 type cleanupReport struct {
 	SchemaVersion int             `json:"schema_version"`
 	Operation     string          `json:"operation"`
@@ -134,12 +138,16 @@ func prepareOperationReports(out string, formats []string) (finish func(cleanupR
 		return nil, nil, err
 	}
 	finished := false
-	finish = func(report cleanupReport) error {
+	finish = func(report cleanupReport) (resultErr error) {
 		if finished {
 			return errors.New("operation reports already finished")
 		}
 		finished = true
-		defer closeFiles()
+		defer func() {
+			for _, file := range files {
+				resultErr = errors.Join(resultErr, file.Close())
+			}
+		}()
 		if report.SchemaVersion == 0 {
 			report.SchemaVersion = 1
 		}
@@ -224,7 +232,7 @@ type scanRecord struct {
 }
 
 // publishScanReports keeps legacy renderers isolated from user-selected paths.
-func publishScanReports(stage, out string, formats []string, root string) error {
+func publishScanReports(stage, out string, formats []string, root string) (resultErr error) {
 	selected := map[string]bool{}
 	for _, format := range formats {
 		selected[format] = true
@@ -239,7 +247,7 @@ func publishScanReports(stage, out string, formats []string, root string) error 
 	for _, file := range entries {
 		name := file.Name()
 		ext := strings.TrimPrefix(filepath.Ext(name), ".")
-		if selected[ext] || (ext != "md" && ext != "json" && ext != "jsonl") {
+		if name == "coverage.json" || selected[ext] || (ext != "md" && ext != "json" && ext != "jsonl") {
 			names = append(names, name)
 		}
 		if (selected["json"] || selected["jsonl"]) && (ext == "tsv" || name == "catalog.jsonl") {
@@ -256,11 +264,15 @@ func publishScanReports(stage, out string, formats []string, root string) error 
 			names = append(names, "report."+format)
 		}
 	}
-	files, closeFiles, err := reserveReports(out, names)
+	files, _, err := reserveReports(out, names)
 	if err != nil {
 		return err
 	}
-	defer closeFiles()
+	defer func() {
+		for _, file := range files {
+			resultErr = errors.Join(resultErr, file.Close())
+		}
+	}()
 	for _, name := range names {
 		f := files[name]
 		if name == "report.json" || name == "report.jsonl" {

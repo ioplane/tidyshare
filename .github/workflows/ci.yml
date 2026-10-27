@@ -73,3 +73,56 @@ jobs:
 
       - name: Build
         run: sudo podman compose run --rm build
+
+  darwin:
+    name: Darwin ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      CGO_ENABLED: "1"
+      GOFLAGS: -tags=remote,exclude_graphdriver_btrfs,containers_image_openpgp
+      TMPDIR: /private/tmp
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.27.3
+      - name: Verify native code
+        run: |
+          go vet ./...
+          go test -race -count=1 -shuffle=on -timeout=3m ./...
+      - name: Build native binary
+        env:
+          TIDYSHARE_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          TIDYSHARE_VERSION=v0.0.0-dev
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            number='(0|[1-9][0-9]*)'
+            [[ "$GITHUB_REF_NAME" =~ ^v$number\.$number\.$number(-[0-9A-Za-z.-]+)?$ ]]
+            TIDYSHARE_VERSION="$GITHUB_REF_NAME"
+          fi
+          mkdir -p .artifacts/darwin
+          TIDYSHARE_BINARY=".artifacts/darwin/tidyshare_${TIDYSHARE_VERSION}_darwin_${TIDYSHARE_ARCH}"
+          go build -trimpath -ldflags "-s -w -X main.version=$TIDYSHARE_VERSION -X main.commit=$GITHUB_SHA" -o "$TIDYSHARE_BINARY" ./cmd/tidyshare
+          "$TIDYSHARE_BINARY" version
+          "$TIDYSHARE_BINARY" doctor -root "$RUNNER_TEMP" -json
+      - name: Upload native binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: darwin-${{ matrix.arch }}-${{ github.sha }}
+          path: .artifacts/darwin/tidyshare_*
+          if-no-files-found: error

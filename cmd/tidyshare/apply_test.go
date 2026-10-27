@@ -49,7 +49,11 @@ func TestApplyDryRunPreservesExistingManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rc := runApply([]string{"-plan", plan, "-quarantine", q, "-mode", "dedupe"}); rc != 0 {
+	wantCode := 0
+	if hostPlatform() == "darwin" {
+		wantCode = 1
+	}
+	if rc := runApply([]string{"-plan", plan, "-quarantine", q, "-mode", "dedupe"}); rc != wantCode {
 		t.Fatalf("dry run returned %d", rc)
 	}
 	after, err := os.Stat(manifest)

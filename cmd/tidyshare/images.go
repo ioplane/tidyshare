@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,12 +21,13 @@ import (
 
 // localImage is one image from the Podman API; ID is the config digest (hex).
 type localImage struct {
-	ID, Owner  string
-	Tags       []string
-	Size       int64
-	Created    int64
-	Dangling   bool
-	Containers int
+	ID, Owner       string
+	IdentityUnknown bool
+	Tags            []string
+	Size            int64
+	Created         int64
+	Dangling        bool
+	Containers      int
 }
 
 // imgArchive is a docker-archive or oci-archive found on the share.
@@ -50,21 +52,37 @@ var (
 
 func scanImages(es []entry, o opts) imageReport {
 	r := imageReport{SystemDF: map[string]string{}, Unavailable: map[string]string{}}
-	owners := append([]string{"root"}, splitList(o.imageUsers)...)
-	seen := map[string]bool{}
-	for _, ow := range owners {
-		if seen[ow] {
-			continue
+	if o.engine == "docker" {
+		store, err := resolveDockerStore(context.Background(), o.dockerContext)
+		if err == nil {
+			var images []localImage
+			var summary string
+			images, summary, err = store.inventory(context.Background())
+			if err == nil {
+				r.Local = images
+				r.SystemDF["docker:"+store.Context] = summary
+			}
 		}
-		seen[ow] = true
-		imgs, df, err := listLocal(o.imageSockets[ow], ow)
 		if err != nil {
-			r.Unavailable[ow] = err.Error()
-			fmt.Fprintf(os.Stderr, "warn: Podman API images (%s): %v\n", ow, err)
-			continue
+			r.Unavailable["docker"] = err.Error()
 		}
-		r.Local = append(r.Local, imgs...)
-		r.SystemDF[ow] = df
+	} else {
+		owners := append([]string{"root"}, splitList(o.imageUsers)...)
+		seen := map[string]bool{}
+		for _, ow := range owners {
+			if seen[ow] {
+				continue
+			}
+			seen[ow] = true
+			imgs, df, err := listLocal(o.imageSockets[ow], ow)
+			if err != nil {
+				r.Unavailable[ow] = err.Error()
+				fmt.Fprintf(os.Stderr, "warn: Podman API images (%s): %v\n", ow, err)
+				continue
+			}
+			r.Local = append(r.Local, imgs...)
+			r.SystemDF[ow] = df
+		}
 	}
 	// archives: only tar/gzip by content, so renamed files are still found
 	var cands []entry
@@ -101,6 +119,10 @@ func scanImages(es []entry, o opts) imageReport {
 
 	have := map[string][]string{}
 	for _, l := range r.Local {
+		if l.IdentityUnknown {
+			r.Unavailable["image-identity"] = "multi-platform config identities are not established"
+			continue
+		}
 		have[l.ID] = append(have[l.ID], l.Owner)
 	}
 	for i := range r.Archives {
@@ -247,7 +269,7 @@ func short(id string) string {
 	return id
 }
 
-func writeImages(r imageReport, o opts) error {
+func writeImages(r imageReport, o opts) (resultErr error) {
 	f, err := os.Create(filepath.Join(o.out, "images.tsv"))
 	if err != nil {
 		return err
@@ -285,10 +307,7 @@ func writeImages(r imageReport, o opts) error {
 		}
 		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\t\n", kind, st, l.Size, short(l.ID), strings.Join(l.Tags, ","), l.Owner)
 	}
-	if err := w.Flush(); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
+	if err := finishReport(w, f); err != nil {
 		return err
 	}
 
@@ -296,7 +315,8 @@ func writeImages(r imageReport, o opts) error {
 	if err != nil {
 		return err
 	}
-	defer md.Close()
+	mw := bufio.NewWriter(md)
+	defer func() { resultErr = errors.Join(resultErr, finishReport(mw, md)) }()
 	var dang, unused int64
 	var nd, nu, untagged int
 	for _, l := range r.Local {
@@ -312,10 +332,10 @@ func writeImages(r imageReport, o opts) error {
 			nu++
 		}
 	}
-	fmt.Fprintf(md, "# Container images\n\n- local images: %d, dangling: %d (%s), tagged without containers: %d (%s; sizes include shared layers), untagged: %d\n- image archives on the share: %d\n\n",
+	fmt.Fprintf(mw, "# Container images\n\n- local images: %d, dangling: %d (%s), tagged without containers: %d (%s; sizes include shared layers), untagged: %d\n- image archives on the share: %d\n\n",
 		len(r.Local), nd, gib(dang), nu, gib(unused), untagged, len(r.Archives))
 	for _, owner := range owners {
-		fmt.Fprintf(md, "- store %q unavailable: %s\n", owner, r.Unavailable[owner])
+		fmt.Fprintf(mw, "- store %q unavailable: %s\n", owner, r.Unavailable[owner])
 	}
 	owners = owners[:0]
 	for owner := range r.SystemDF {
@@ -324,11 +344,11 @@ func writeImages(r imageReport, o opts) error {
 	slices.Sort(owners)
 	for _, ow := range owners {
 		df := r.SystemDF[ow]
-		fmt.Fprintf(md, "## Podman API disk usage (%s)\n\n```text\n%s```\n\n", ow, df)
+		fmt.Fprintf(mw, "## Container API disk usage (%s)\n\n```text\n%s```\n\n", ow, df)
 	}
-	fmt.Fprint(md, "## Image archives vs local storage\n\n| status | size | ids | tags | stores | path |\n|:---|---:|:---|:---|:---|:---|\n")
+	fmt.Fprint(mw, "## Image archives vs local storage\n\n| status | size | ids | tags | stores | path |\n|:---|---:|:---|:---|:---|:---|\n")
 	for _, a := range r.Archives {
-		fmt.Fprintf(md, "| %s | %s | %s | %s | %s | %s |\n", a.Status, gib(a.Size),
+		fmt.Fprintf(mw, "| %s | %s | %s | %s | %s | %s |\n", a.Status, gib(a.Size),
 			strings.Join(shorts(a.IDs), " "), strings.Join(a.Tags, " "), strings.Join(a.Stores, " "), a.Path)
 	}
 	return nil

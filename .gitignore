@@ -28,3 +28,6 @@ AGENTS.local.md
 CLAUDE.md
 CLAUDE.local.md
 GEMINI.md
+
+# Owned immutable input for the modernization assessment; hashes are tracked.
+/legacy/tidyshare/
