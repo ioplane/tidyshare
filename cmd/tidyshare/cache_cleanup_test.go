@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 import (
@@ -328,17 +330,6 @@ func TestCacheCleanupStopsNativeDescendants(t *testing.T) {
 				t.Fatalf("partial cancellation reported as unchanged: %+v", result.report)
 			}
 		})
-	}
-}
-
-func cacheBareGitFixture(t *testing.T, path string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	command := exec.CommandContext(ctx, "git", "-c", "core.hooksPath=/dev/null", "init", "--bare", "--template=", "--initial-branch=fixture", path)
-	command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}
-	if output, err := command.CombinedOutput(); err != nil {
-		t.Fatalf("init bare fixture: %v: %s", err, output)
 	}
 }
 

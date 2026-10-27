@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,7 +38,7 @@ func ancestors(p, root string, f func(d string)) {
 	}
 }
 
-func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error {
+func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) (resultErr error) {
 	cut := time.Now().AddDate(0, 0, -o.staleDays).Unix()
 	dup := map[string]bool{}
 	for _, g := range groups {
@@ -181,10 +182,7 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 	for _, d := range coldDirs {
 		row(3, "cold-dir", dirs[d].bytes, dirs[d].files, d, "newest mtime "+time.Unix(dirs[d].newest, 0).UTC().Format("2006-01-02"))
 	}
-	if err := tw.Flush(); err != nil {
-		return err
-	}
-	if err := tsv.Close(); err != nil {
+	if err := finishReport(tw, tsv); err != nil {
 		return err
 	}
 
@@ -192,9 +190,8 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 	if err != nil {
 		return err
 	}
-	defer md.Close()
 	w := bufio.NewWriter(md)
-	defer w.Flush()
+	defer func() { resultErr = errors.Join(resultErr, finishReport(w, md)) }()
 	fmt.Fprintf(w, "# Deletion candidates for %s\n\nThis scan does not delete data. Each file is counted once, in its lowest tier.\n\n| tier | meaning | files | size |\n|:---|:---|---:|---:|\n", markdownCell(o.root))
 	for t := 1; t <= 3; t++ {
 		fmt.Fprintf(w, "| %d | %s | %d | %s |\n", t, []string{"", "safe: duplicate copy, junk", "review: image archive in storage, cache", fmt.Sprintf("decide: untouched %d d, regenerable output", o.staleDays)}[t], tierFiles[t], gib(tierBytes[t]))

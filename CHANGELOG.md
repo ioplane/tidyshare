@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Native Darwin file scans, Git/cache discovery, quarantine and duplicate cleanup.
+- Read-only Docker inventory for local contexts, including OrbStack, through CLI and MCP.
+- Workstation protections, platform-bound cache plans and capability diagnostics.
+- Allocated-block accounting and structured scan coverage warnings.
+
+### Changed
+
+- New cache plans use schema version 2. Linux retains version 1 compatibility.
+- Native Darwin cache guards refuse incomplete process or mount visibility.
+  Successful idle-cache cleanup remains unqualified.
+- Docker cleanup and Darwin extent deduplication remain unsupported.
+
+
 ## [0.1.0] - 2026-10-21
 
 ### Changed

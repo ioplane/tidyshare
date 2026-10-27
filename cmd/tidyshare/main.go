@@ -9,6 +9,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -16,6 +17,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -59,26 +61,36 @@ func init() {
 type entry struct {
 	Path, Area, Cat string
 	Size            int64
+	Allocated       int64
 	Mtime, Atime    int64
 	Dev, Ino        uint64
 	Mime            string // detected from content, not from the extension
 	Stale           string // "", "junk", "cold"
 }
 
+type scanWarning struct {
+	Path      string `json:"path"`
+	Operation string `json:"operation"`
+	Reason    string `json:"reason"`
+}
+
 type opts struct {
-	root, out          string
-	minSize            int64
-	settle             time.Duration
-	staleDays          int
-	workers, depth     int
-	skip               map[string]bool
-	imageUsers         string
-	formats            []string
-	imageSockets       map[string]string
-	images             bool
-	yaraRules, yaraBin string
-	yaraCats           string
-	yaraMax            int64
+	warnings              *[]scanWarning
+	root, out             string
+	policy                storagePolicy
+	engine, dockerContext string
+	minSize               int64
+	settle                time.Duration
+	staleDays             int
+	workers, depth        int
+	skip                  map[string]bool
+	imageUsers            string
+	formats               []string
+	imageSockets          map[string]string
+	images                bool
+	yaraRules, yaraBin    string
+	yaraCats              string
+	yaraMax               int64
 }
 
 // version, commit are set at link time by the release build.
@@ -93,6 +105,11 @@ commands:
   scan      read-only scan; writes reports to -out
   discover  find language caches and Git trees; write a cache cleanup plan
   apply     act on a reviewed dups.tsv (dry run unless -yes)
+  images    inventory local Podman or Docker images
+  doctor    inspect platform, filesystem and cleanup capabilities
+  workstation  inventory selected workstation caches and projects
+  managed-plan  plan scoped native cleanup and stale file manifests
+  managed-clean  apply reviewed managed targets (dry run unless -yes)
   images-plan  plan conservative orphan image cleanup
   cleanup   clear reviewed caches, duplicate files or orphan images (dry run unless -yes)
   mcp       serve local MCP tools over stdio
@@ -107,6 +124,16 @@ func main() {
 		cmd = os.Args[1]
 	}
 	switch cmd {
+	case "managed-plan":
+		os.Exit(runManagedPlan(os.Args[2:]))
+	case "managed-clean":
+		os.Exit(runManagedClean(os.Args[2:]))
+	case "workstation":
+		os.Exit(runWorkstation(os.Args[2:]))
+	case "doctor":
+		os.Exit(runDoctor(os.Args[2:]))
+	case "images":
+		os.Exit(runImages(os.Args[2:]))
 	case "scan":
 		os.Exit(runScan(os.Args[2:]))
 	case "discover":
@@ -132,8 +159,15 @@ func main() {
 }
 
 func runScan(args []string) int {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	return runScanContext(ctx, args)
+}
+
+func runScanContext(ctx context.Context, args []string) int {
 	var o opts
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+	profile, protected := policyFlags(fs)
 	skip := fs.String("skip", "", "comma-separated absolute dirs to skip")
 	fs.StringVar(&o.root, "root", "", "tree to scan (required)")
 	fs.StringVar(&o.out, "out", "tidyshare-report", "report directory; keep it off a nearly full share")
@@ -143,7 +177,8 @@ func runScan(args []string) int {
 	fs.IntVar(&o.workers, "workers", 8, "parallel hashers")
 	fs.IntVar(&o.depth, "depth", 3, "directory summary depth under root")
 	fs.BoolVar(&o.images, "images", true, "scan container images and match image archives")
-	engine := fs.String("engine", "podman", "deprecated: only podman is supported; inventory uses the Go SDK")
+	engine := fs.String("engine", "podman", "image inventory provider: podman or docker")
+	fs.StringVar(&o.dockerContext, "docker-context", "", "local Docker context")
 	imageSockets := fs.String("image-sockets", "", "comma-separated owner=unix:///path API sockets for requested image stores")
 	formats := fs.String("formats", "json,jsonl,md", "comma-separated report formats: json,jsonl,md; TSV plans are always retained")
 	fs.StringVar(&o.imageUsers, "image-users", "", "comma-separated rootless users whose storage is also listed")
@@ -163,10 +198,15 @@ func runScan(args []string) int {
 	if o.workers <= 0 || o.minSize <= 0 || o.settle < 0 || o.staleDays < 0 || o.depth < 0 || fs.NArg() != 0 {
 		return fail(errors.New("workers and min-size must be positive; settle, stale-days and depth must be non-negative; no positional arguments"))
 	}
-	if *engine != "podman" {
-		return fail(errors.New("-engine no longer executes binaries; use -image-sockets with the Podman API"))
+	if *engine != "podman" && *engine != "docker" {
+		return fail(errors.New("-engine must be podman or docker"))
 	}
+	o.engine = *engine
 	var err error
+	o.policy, err = newStoragePolicy(*profile, *protected)
+	if err != nil {
+		return fail(err)
+	}
 	o.formats, err = parseReportFormats(*formats)
 	if err != nil {
 		return fail(err)
@@ -197,39 +237,65 @@ func runScan(args []string) int {
 		o.skip[abs] = true
 	}
 	reportOut := o.out
-	stage, err := os.MkdirTemp("", "tidyshare-reports-")
+	stage, err := privateTemp("tidyshare-reports-")
 	if err != nil {
 		return fail(err)
 	}
-	defer os.RemoveAll(stage)
+	retainStage := false
+	defer func() {
+		if !retainStage {
+			_ = os.RemoveAll(stage)
+		}
+	}()
+	scanFailure := func(err error) int {
+		retainStage = true
+		return fail(fmt.Errorf("scan failed; private partial reports retained at %s: %w", stage, err))
+	}
 	o.out = stage
+	var warnings []scanWarning
+	o.warnings = &warnings
 	es, err := walk(o)
 	if err != nil {
-		return fail(err)
+		return scanFailure(err)
 	}
 	fmt.Fprintf(os.Stderr, "scanned %d files\n", len(es))
 	detectMime(es, o.workers)
+	for _, e := range es {
+		if e.Mime == "unreadable" {
+			warnings = append(warnings, scanWarning{e.Path, "mime", "content unavailable"})
+		}
+	}
 	groups := findDups(es, o)
+	coverage, err := json.Marshal(map[string]any{"complete": len(warnings) == 0, "warnings": warnings})
+	if err != nil {
+		return scanFailure(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "coverage.json"), coverage, 0o600); err != nil {
+		return scanFailure(err)
+	}
 	if err := writeReports(es, groups, o); err != nil {
-		return fail(err)
+		return scanFailure(err)
 	}
 	var ir imageReport
 	if o.images {
 		ir = scanImages(es, o)
 		if err := writeImages(ir, o); err != nil {
-			return fail(err)
+			return scanFailure(err)
 		}
 	}
-	if _, err := runYara(es, o); err != nil {
-		fmt.Fprintln(os.Stderr, "warn: yara:", err)
+	if _, err := runYara(ctx, es, o); err != nil {
+		return scanFailure(err)
 	}
 	if err := writeCandidates(es, groups, ir, o); err != nil {
-		return fail(err)
+		return scanFailure(err)
 	}
 	if err := publishScanReports(stage, reportOut, o.formats, o.root); err != nil {
-		return fail(err)
+		return scanFailure(err)
 	}
 	fmt.Fprintf(os.Stderr, "reports in %s\n", reportOut)
+	if len(warnings) > 0 {
+		return fail(errors.New("scan coverage is incomplete; inspect coverage.json"))
+	}
 	return 0
 }
 
@@ -243,15 +309,24 @@ func walk(o opts) ([]entry, error) {
 	cutoff := time.Now().AddDate(0, 0, -o.staleDays).Unix()
 	var es []entry
 	err := filepath.WalkDir(o.root, func(p string, d fs.DirEntry, err error) error {
+		if o.policy.excludes(p) {
+			if d != nil && d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "warn:", err)
+			if o.warnings != nil {
+				*o.warnings = append(*o.warnings, scanWarning{p, "walk", err.Error()})
+			}
 			if d != nil && d.IsDir() {
 				return fs.SkipDir
 			}
 			return nil
 		}
 		if d.IsDir() {
-			if o.skip[p] {
+			if o.skip[p] || o.policy.excludes(p) || (o.policy.Profile == "workstation" && cacheKind(p, true) != "") {
 				return fs.SkipDir
 			}
 			return nil
@@ -261,14 +336,17 @@ func walk(o opts) ([]entry, error) {
 		}
 		info, err := d.Info()
 		if err != nil {
+			if o.warnings != nil {
+				*o.warnings = append(*o.warnings, scanWarning{p, "stat", err.Error()})
+			}
 			return nil
 		}
 		st := info.Sys().(*syscall.Stat_t)
 		rel, _ := filepath.Rel(o.root, p)
 		area, _, _ := strings.Cut(rel, string(filepath.Separator))
 		e := entry{
-			Path: p, Area: area, Size: info.Size(), Mtime: info.ModTime().Unix(),
-			Atime: st.Atim.Sec, Dev: uint64(st.Dev), Ino: st.Ino,
+			Path: p, Area: area, Size: info.Size(), Allocated: st.Blocks * 512, Mtime: info.ModTime().Unix(),
+			Atime: fileAtime(info), Dev: uint64(st.Dev), Ino: st.Ino,
 		}
 		e.Cat = categorize(p)
 		e.Stale = staleReason(p, e, cutoff)
@@ -373,12 +451,12 @@ func findDups(es []entry, o opts) [][]entry {
 		}
 	}
 	for _, h := range []func(string, int64) ([16]byte, error){sampleHash, fullHash} {
-		groups = regroup(groups, h, o.workers)
+		groups = regroup(groups, h, o.workers, o.warnings)
 	}
 	return groups
 }
 
-func regroup(groups [][]entry, h func(string, int64) ([16]byte, error), workers int) [][]entry {
+func regroup(groups [][]entry, h func(string, int64) ([16]byte, error), workers int, warnings *[]scanWarning) [][]entry {
 	type job struct{ gi, ei int }
 	sums := make([][][16]byte, len(groups))
 	jobs := make(chan job)
@@ -396,6 +474,11 @@ func regroup(groups [][]entry, h func(string, int64) ([16]byte, error), workers 
 				s, err := h(e.Path, e.Size)
 				if err != nil {
 					fmt.Fprintln(os.Stderr, "warn: hash:", err)
+					if warnings != nil {
+						mu.Lock()
+						*warnings = append(*warnings, scanWarning{e.Path, "hash", err.Error()})
+						mu.Unlock()
+					}
 					continue // unreadable file is dropped from dedup, never deleted
 				}
 				mu.Lock()
@@ -497,26 +580,24 @@ func keeperOrder(g []entry) {
 
 func gib(b int64) string { return fmt.Sprintf("%.2f GiB", float64(b)/(1<<30)) }
 
-func writeReports(es []entry, groups [][]entry, o opts) error {
+func writeReports(es []entry, groups [][]entry, o opts) (resultErr error) {
 	// catalog.jsonl: one record per file, same shape idea as the old share-catalog.jsonl
 	cf, err := os.Create(filepath.Join(o.out, "catalog.jsonl"))
 	if err != nil {
 		return err
 	}
 	cw := bufio.NewWriterSize(cf, 1<<20)
+	defer func() { resultErr = errors.Join(resultErr, finishReport(cw, cf)) }()
 	enc := json.NewEncoder(cw)
 	for _, e := range es {
 		if err := enc.Encode(map[string]any{
 			"path": e.Path, "area": e.Area, "category": e.Cat,
-			"mime": e.Mime, "size": e.Size, "mtime": e.Mtime, "atime": e.Atime, "stale": e.Stale,
+			"mime": e.Mime, "size": e.Size, "allocated_bytes": e.Allocated, "mtime": e.Mtime, "atime": e.Atime, "stale": e.Stale,
 		}); err != nil {
 			return err
 		}
 	}
 	if err := cw.Flush(); err != nil {
-		return err
-	}
-	if err := cf.Close(); err != nil {
 		return err
 	}
 
@@ -532,6 +613,7 @@ func writeReports(es []entry, groups [][]entry, o opts) error {
 		return err
 	}
 	dw := bufio.NewWriter(df)
+	defer func() { resultErr = errors.Join(resultErr, finishReport(dw, df)) }()
 	fmt.Fprintln(dw, "group\taction\tsize\tmtime\tpath")
 	var reclaim int64
 	var dupFiles int
@@ -550,9 +632,6 @@ func writeReports(es []entry, groups [][]entry, o opts) error {
 	if err := dw.Flush(); err != nil {
 		return err
 	}
-	if err := df.Close(); err != nil {
-		return err
-	}
 
 	// stale.tsv, largest first
 	var stale []entry
@@ -569,14 +648,12 @@ func writeReports(es []entry, groups [][]entry, o opts) error {
 		return err
 	}
 	sw := bufio.NewWriter(sf)
+	defer func() { resultErr = errors.Join(resultErr, finishReport(sw, sf)) }()
 	fmt.Fprintln(sw, "reason\tsize\tmtime\tatime\tpath")
 	for _, e := range stale {
 		fmt.Fprintf(sw, "%s\t%d\t%d\t%d\t%s\n", e.Stale, e.Size, e.Mtime, e.Atime, strconv.Quote(e.Path))
 	}
 	if err := sw.Flush(); err != nil {
-		return err
-	}
-	if err := sf.Close(); err != nil {
 		return err
 	}
 
@@ -609,7 +686,7 @@ func (a *agg) top() string {
 	return best
 }
 
-func writeSummary(es []entry, o opts, ng, nd int, reclaim int64, ns int, staleBytes int64) error {
+func writeSummary(es []entry, o opts, ng, nd int, reclaim int64, ns int, staleBytes int64) (resultErr error) {
 	cats, areas, dirs, mimes := map[string]*agg{}, map[string]*agg{}, map[string]*agg{}, map[string]*agg{}
 	get := func(m map[string]*agg, k string) *agg {
 		if m[k] == nil {
@@ -617,9 +694,15 @@ func writeSummary(es []entry, o opts, ng, nd int, reclaim int64, ns int, staleBy
 		}
 		return m[k]
 	}
-	var total int64
+	var total, allocated int64
+	seenAllocated := map[[2]uint64]bool{}
 	for _, e := range es {
 		total += e.Size
+		key := [2]uint64{e.Dev, e.Ino}
+		if !seenAllocated[key] {
+			allocated += e.Allocated
+			seenAllocated[key] = true
+		}
 		get(cats, e.Cat).add(e)
 		get(areas, e.Area).add(e)
 		get(mimes, e.Mime).add(e)
@@ -636,9 +719,8 @@ func writeSummary(es []entry, o opts, ng, nd int, reclaim int64, ns int, staleBy
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	w := bufio.NewWriter(f)
-	defer w.Flush()
+	defer func() { resultErr = errors.Join(resultErr, finishReport(w, f)) }()
 	fmt.Fprintf(w, "# %s report, %s\n\n- files: %d, bytes: %s\n- duplicate groups: %d, redundant files: %d, logical duplicate bytes: %s (min-size %s)\n- stale files (junk, or mtime older than %d d): %d, %s\n\n",
 		o.root, time.Now().Format("2006-01-02"), len(es), gib(total), ng, nd, gib(reclaim),
 		strconv.FormatInt(o.minSize>>20, 10)+" MiB", o.staleDays, ns, gib(staleBytes))
@@ -666,6 +748,7 @@ func writeSummary(es []entry, o opts, ng, nd int, reclaim int64, ns int, staleBy
 			cold[k] = a
 		}
 	}
+	fmt.Fprintf(w, "Allocated blocks (hardlinks counted once): %s. Shared APFS extents can appear in multiple files. This is not predicted recovered space.\n\n", gib(allocated))
 	table("By category", cats, 50)
 	table("By MIME (content), 40 largest", mimes, 40)
 	table("By top-level area", areas, 50)
@@ -740,6 +823,9 @@ func readPlan(f io.Reader) (map[string][]row, []string, error) {
 // plainPath rejects symlinks in every component. For a missing path it returns
 // the nearest existing ancestor so dry runs can check the filesystem without writes.
 func plainPath(path string, allowMissing bool) (os.FileInfo, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, errors.New("path must be clean and absolute")
+	}
 	var nearest os.FileInfo
 	for cur := path; ; cur = filepath.Dir(cur) {
 		st, err := os.Lstat(cur)
@@ -763,6 +849,7 @@ func plainPath(path string, allowMissing bool) (os.FileInfo, error) {
 
 func runApply(args []string) int {
 	fs := flag.NewFlagSet("apply", flag.ContinueOnError)
+	profile, protected := policyFlags(fs)
 	plan := fs.String("plan", "", "dups.tsv from scan")
 	mode := fs.String("mode", "quarantine", "quarantine: move dups aside; dedupe: share extents with the keeper (XFS reflink), paths stay")
 	q := fs.String("quarantine", "", "quarantine dir on the SAME filesystem as the files (mode quarantine; manifest dir for dedupe)")
@@ -776,6 +863,9 @@ func runApply(args []string) int {
 	}
 	if *plan == "" || *q == "" || (*mode != "quarantine" && *mode != "dedupe") || *limit < 0 || fs.NArg() != 0 {
 		return fail(errors.New("-plan and -quarantine are required, -mode is quarantine|dedupe, -limit must be non-negative; no positional arguments"))
+	}
+	if *mode == "dedupe" && hostPlatform() != "linux" {
+		return fail(errors.New("extent deduplication is unsupported on this platform"))
 	}
 	f, err := os.Open(*plan)
 	if err != nil {
@@ -801,6 +891,17 @@ func runApply(args []string) int {
 		for _, r := range rows {
 			if r.path == *q || strings.HasPrefix(r.path, strings.TrimSuffix(*q, "/")+"/") {
 				return fail(errors.New("plan source is inside quarantine"))
+			}
+		}
+	}
+	policy, err := newStoragePolicy(*profile, *protected)
+	if err != nil {
+		return fail(err)
+	}
+	for _, rows := range groups {
+		for _, r := range rows {
+			if policy.excludes(r.path) {
+				return fail(errors.New("apply target is protected"))
 			}
 		}
 	}
@@ -842,9 +943,9 @@ func runApply(args []string) int {
 	var moved, skipped int
 	var bytes int64
 	free := func() uint64 {
-		var st syscall.Statfs_t
-		_ = syscall.Statfs(qstPath(*q), &st)
-		return st.Bavail * uint64(st.Bsize)
+		var st unix.Statfs_t
+		_ = unix.Statfs(qstPath(*q), &st)
+		return uint64(st.Bavail) * uint64(st.Bsize)
 	}
 	freeBefore := free()
 	for _, id := range order {
@@ -889,7 +990,7 @@ func runApply(args []string) int {
 					if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 						return fail(err)
 					}
-					err = unix.Renameat2(unix.AT_FDCWD, r.path, unix.AT_FDCWD, dst, unix.RENAME_NOREPLACE)
+					err = renameNoReplace(unix.AT_FDCWD, r.path, unix.AT_FDCWD, dst)
 				}
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "warn: %s %s: %v\n", *mode, r.path, err)
@@ -930,54 +1031,6 @@ func qstPath(path string) string {
 		}
 		path = filepath.Dir(path)
 	}
-}
-
-// dedupe makes dup share its extents with keeper through FIDEDUPERANGE. The
-// kernel compares the bytes itself and refuses (status DIFFERS) if they differ,
-// so no content can be lost; mtime, owner, ACLs and the path of dup are kept.
-func dedupe(keeper, dup string, size int64) error {
-	src, err := os.OpenFile(keeper, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-	dst, err := os.OpenFile(dup, os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return err
-	}
-	defer dst.Close()
-	srcInfo, err := src.Stat()
-	if err != nil {
-		return err
-	}
-	dstInfo, err := dst.Stat()
-	if err != nil {
-		return err
-	}
-	if size <= 0 || !srcInfo.Mode().IsRegular() || !dstInfo.Mode().IsRegular() || srcInfo.Size() != size || dstInfo.Size() != size || srcInfo.Sys().(*syscall.Stat_t).Dev != dstInfo.Sys().(*syscall.Stat_t).Dev {
-		return errors.New("dedupe requires regular files of the planned size on one filesystem")
-	}
-	const chunk = 16 << 20
-	for off := int64(0); off < size; {
-		r := unix.FileDedupeRange{
-			Src_offset: uint64(off), Src_length: uint64(min(chunk, size-off)),
-			Info: []unix.FileDedupeRangeInfo{{Dest_fd: int64(dst.Fd()), Dest_offset: uint64(off)}},
-		}
-		if err := unix.IoctlFileDedupeRange(int(src.Fd()), &r); err != nil {
-			return err
-		}
-		switch i := r.Info[0]; {
-		case i.Status == unix.FILE_DEDUPE_RANGE_DIFFERS:
-			return errors.New("content differs")
-		case i.Status != unix.FILE_DEDUPE_RANGE_SAME:
-			return syscall.Errno(-i.Status)
-		case i.Bytes_deduped == 0:
-			return errors.New("no progress")
-		default:
-			off += int64(i.Bytes_deduped)
-		}
-	}
-	return nil
 }
 
 // unchanged guards against the file having been modified since the scan.

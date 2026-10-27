@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func cacheFixture(t *testing.T, suffix, file string) cachePlan {
@@ -21,7 +23,7 @@ func cacheFixture(t *testing.T, suffix, file string) cachePlan {
 	if err != nil || target == nil {
 		t.Fatalf("target: %v, %v", target, err)
 	}
-	return cachePlan{SchemaVersion: 1, Root: root, Targets: []cacheTarget{*target}}
+	return cachePlan{SchemaVersion: 2, Platform: hostPlatform(), Root: root, Targets: []cacheTarget{*target}}
 }
 
 func TestLanguageCacheCanonicalCatalog(t *testing.T) {
@@ -95,7 +97,7 @@ func TestLanguageCacheCustomEnvironmentAndProtectedRoots(t *testing.T) {
 	if err != nil || target == nil || target.Kind != "go_build" {
 		t.Fatalf("custom cache: %+v %v", target, err)
 	}
-	p := cachePlan{SchemaVersion: 1, Root: root, Targets: []cacheTarget{*target}}
+	p := cachePlan{SchemaVersion: 2, Platform: hostPlatform(), Root: root, Targets: []cacheTarget{*target}}
 	if err := os.Rename(filepath.Join(custom, "00"), filepath.Join(root, "old-marker")); err != nil {
 		t.Fatal(err)
 	}
@@ -136,5 +138,16 @@ func TestLanguageCacheLeavesBareRootForGitDiscovery(t *testing.T) {
 	target, err := cacheTargetAt(context.Background(), p.Targets[0].Path)
 	if err != nil || target != nil {
 		t.Fatalf("bare repository is classified as a cache: %+v %v", target, err)
+	}
+}
+
+func cacheBareGitFixture(t *testing.T, path string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, "git", "-c", "core.hooksPath=/dev/null", "init", "--bare", "--template=", "--initial-branch=fixture", path)
+	command.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + t.TempDir(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null"}
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("init bare fixture: %v: %s", err, output)
 	}
 }

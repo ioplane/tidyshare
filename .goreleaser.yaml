@@ -3,6 +3,11 @@ version: 2
 project_name: tidyshare
 dist: .artifacts/release
 
+snapshot:
+  version_template: "{{ .Env.TIDYSHARE_RELEASE_VERSION }}"
+
+# Darwin uses native CGO jobs in the release workflow.
+# The release job combines those assets with these static Linux assets.
 builds:
   - main: ./cmd/tidyshare
     binary: tidyshare
@@ -13,7 +18,7 @@ builds:
     tags: [remote, exclude_graphdriver_btrfs, containers_image_openpgp]
     flags: [-trimpath]
     ldflags:
-      - -s -w -X main.version=v{{ .Version }} -X main.commit={{ .FullCommit }}
+      - "{{ .Env.TIDYSHARE_LDFLAGS }}"
 
 archives:
   - formats: [binary]

@@ -13,6 +13,10 @@ FROM docker.io/library/golang:1.27.3-trixie@sha256:1896654cfc5c2b5ad74c07f29cb36
 LABEL org.opencontainers.image.source="https://github.com/ioplane/tidyshare" \
       org.opencontainers.image.description="tidyshare development and verification toolchain"
 
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends lsof procps \
+    && rm -rf /var/lib/apt/lists/*
+
 ENV CGO_ENABLED=0 \
     GOCACHE=/tmp/go-build \
     GOMODCACHE=/opt/go/pkg/mod \

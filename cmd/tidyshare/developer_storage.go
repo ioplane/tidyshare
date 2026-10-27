@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -24,10 +25,16 @@ type discoveryReport struct {
 	Caches        []cacheTarget `json:"caches"`
 	GitTrees      []gitTree     `json:"git_trees"`
 	Warnings      []string      `json:"warnings"`
+	Policy        storagePolicy `json:"policy,omitempty"`
 }
 
 func discoverStorage(ctx context.Context, root, out string) (discoveryReport, error) {
+	return discoverStorageWithPolicy(ctx, root, out, storagePolicy{})
+}
+
+func discoverStorageWithPolicy(ctx context.Context, root, out string, policy storagePolicy) (discoveryReport, error) {
 	report := discoveryReport{SchemaVersion: 1, Operation: "discover", Root: root, Caches: []cacheTarget{}, GitTrees: []gitTree{}, Warnings: []string{}}
+	report.Policy = policy
 	trees := map[string]gitTree{}
 	warn := func(path string, err error) {
 		if len(report.Warnings) < 1000 {
@@ -50,6 +57,12 @@ func discoverStorage(ctx context.Context, root, out string) (discoveryReport, er
 		return bare
 	}
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if policy.excludes(path) {
+			if entry != nil && entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -65,7 +78,7 @@ func discoverStorage(ctx context.Context, root, out string) (discoveryReport, er
 			}
 			return nil
 		}
-		if path == out {
+		if path == out || policy.excludes(path) {
 			return fs.SkipDir
 		}
 		if entry.Name() == ".git" && path != root {
@@ -75,6 +88,9 @@ func discoverStorage(ctx context.Context, root, out string) (discoveryReport, er
 		cache, err := cacheTargetAt(ctx, path)
 		if err != nil {
 			warn(path, err)
+			return fs.SkipDir
+		}
+		if cache != nil && policy.overlaps(path) {
 			return fs.SkipDir
 		}
 		if cache != nil {
@@ -92,6 +108,7 @@ func discoverStorage(ctx context.Context, root, out string) (discoveryReport, er
 
 func runDiscover(args []string) int {
 	flags := flag.NewFlagSet("discover", flag.ContinueOnError)
+	profile, protected := policyFlags(flags)
 	root := flags.String("root", "", "directory to inspect for language caches and Git trees (required)")
 	out := flags.String("out", "", "new report directory (required)")
 	formatsValue := flags.String("formats", "json,jsonl,md", "comma-separated json,jsonl,md; cache-plan.json is always retained")
@@ -128,7 +145,11 @@ func runDiscover(args []string) int {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	report, walkErr := discoverStorage(ctx, *root, *out)
+	policy, err := newStoragePolicy(*profile, *protected)
+	if err != nil {
+		return fail(err)
+	}
+	report, walkErr := discoverStorageWithPolicy(ctx, *root, *out, policy)
 	if err := writeDiscoveryReports(*out, formats, report); err != nil {
 		return fail(errors.Join(walkErr, err))
 	}
@@ -143,7 +164,12 @@ func runDiscover(args []string) int {
 }
 
 func writeDiscoveryReports(out string, formats []string, report discoveryReport) error {
-	plan := cachePlan{SchemaVersion: 1, Root: report.Root, Targets: []cacheTarget{}}
+	for _, cache := range report.Caches {
+		if cacheWithin(cache.Path, out) {
+			return errors.New("reports must remain outside discovered caches")
+		}
+	}
+	plan := cachePlan{SchemaVersion: 2, Platform: runtime.GOOS, Policy: report.Policy, Root: report.Root, Targets: []cacheTarget{}}
 	for _, cache := range report.Caches {
 		if cache.Cleanup {
 			plan.Targets = append(plan.Targets, cache)

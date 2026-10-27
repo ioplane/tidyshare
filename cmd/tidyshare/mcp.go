@@ -24,6 +24,8 @@ const mcpOutputLimit = 8 << 20
 
 type mcpOptions struct {
 	root, out               string
+	policy                  storagePolicy
+	engine, dockerContext   string
 	allowCleanup            bool
 	imageOwner, imageSocket string
 }
@@ -31,6 +33,7 @@ type mcpOperations struct {
 	options           mcpOptions
 	rootInfo, outInfo os.FileInfo
 	executable        string
+	docker            *dockerStore
 }
 type mcpScanInput struct {
 	Path    string `json:"path,omitempty" jsonschema:"directory within the startup root; omitted means the root"`
@@ -51,15 +54,19 @@ type mcpCleanupInput struct {
 	Formats  string `json:"formats,omitempty" jsonschema:"comma-separated json,jsonl,md; omitted means all three"`
 }
 type mcpOperationResult struct {
-	Summary   string   `json:"summary"`
-	ReportDir string   `json:"report_dir"`
-	Reports   []string `json:"reports"`
-	Execute   bool     `json:"execute"`
+	Summary    string   `json:"summary"`
+	ReportDir  string   `json:"report_dir"`
+	Reports    []string `json:"reports"`
+	Execute    bool     `json:"execute"`
+	PlanSHA256 string   `json:"plan_sha256,omitempty"`
 }
 
 func runMCP(args []string) error {
 	var o mcpOptions
 	flags := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	profile, protected := policyFlags(flags)
+	flags.StringVar(&o.engine, "engine", "podman", "image provider: podman or docker")
+	flags.StringVar(&o.dockerContext, "docker-context", "", "local Docker context")
 	flags.StringVar(&o.root, "root", "", "allowed discovery, scan and file/cache cleanup root (required)")
 	flags.StringVar(&o.out, "out", "", "private report parent directory (required)")
 	flags.BoolVar(&o.allowCleanup, "allow-cleanup", false, "allow tools to request cleanup explicitly")
@@ -74,6 +81,11 @@ func runMCP(args []string) error {
 	if flags.NArg() != 0 {
 		return errors.New("mcp accepts no positional arguments")
 	}
+	var err error
+	o.policy, err = newStoragePolicy(*profile, *protected)
+	if err != nil {
+		return err
+	}
 	operations, err := newMCPOperations(o)
 	if err != nil {
 		return err
@@ -84,6 +96,12 @@ func runMCP(args []string) error {
 }
 
 func newMCPOperations(o mcpOptions) (*mcpOperations, error) {
+	if o.engine == "" {
+		o.engine = "podman"
+	}
+	if o.engine != "podman" && o.engine != "docker" {
+		return nil, errors.New("unsupported image engine")
+	}
 	if o.root == "" || o.out == "" {
 		return nil, errors.New("mcp requires -root and -out")
 	}
@@ -96,7 +114,7 @@ func newMCPOperations(o mcpOptions) (*mcpOperations, error) {
 	if err != nil {
 		return nil, err
 	}
-	if mcpWithin(o.root, o.out) || mcpWithin(o.out, o.root) {
+	if protectedWithin(o.root, o.out) || protectedWithin(o.out, o.root) {
 		return nil, errors.New("mcp data root and report directory must not overlap")
 	}
 	rootInfo, err := plainPath(o.root, false)
@@ -133,7 +151,17 @@ func newMCPOperations(o mcpOptions) (*mcpOperations, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &mcpOperations{options: o, rootInfo: rootInfo, outInfo: outInfo, executable: executable}, nil
+	op := &mcpOperations{options: o, rootInfo: rootInfo, outInfo: outInfo, executable: executable}
+	if o.engine == "docker" {
+		op.docker, err = resolveDockerStore(context.Background(), o.dockerContext)
+		if err != nil {
+			return nil, err
+		}
+		if _, _, err = op.docker.inventory(context.Background()); err != nil {
+			return nil, err
+		}
+	}
+	return op, nil
 }
 
 func (o *mcpOperations) server() *mcp.Server {
@@ -142,6 +170,18 @@ func (o *mcpOperations) server() *mcp.Server {
 	// Planning tools create private reports; annotations describe their additive effect.
 	planning := &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &nonDestructive, OpenWorldHint: &closed}
 	cleanup := &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &destructive, OpenWorldHint: &closed}
+	mcp.AddTool(server, &mcp.Tool{Name: "plan_managed_cleanup", Description: "Create a separate managed cleanup plan. Qualify native commands on private fixtures. Do not remove user data.", Annotations: planning}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpManagedPlanInput) (*mcp.CallToolResult, mcpOperationResult, error) {
+		result, err := o.planManaged(ctx, in)
+		return mcpReply(result, err)
+	})
+	mcp.AddTool(server, &mcp.Tool{Name: "cleanup_managed", Description: "Apply reviewed managed targets. Dry run is the default. Execution requires startup permission, the exact plan digest and selected targets.", Annotations: cleanup}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpManagedCleanInput) (*mcp.CallToolResult, mcpOperationResult, error) {
+		result, err := o.cleanManaged(ctx, in)
+		return mcpReply(result, err)
+	})
+	mcp.AddTool(server, &mcp.Tool{Name: "inventory_workstation", Description: "Inspect selected workstation caches and projects. Write private reports. Do not remove data.", Annotations: planning}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpWorkstationInput) (*mcp.CallToolResult, mcpOperationResult, error) {
+		result, err := o.inventoryWorkstation(ctx, in)
+		return mcpReply(result, err)
+	})
 	mcp.AddTool(server, &mcp.Tool{Name: "discover", Description: "Find language caches and Git trees inside the configured root and write a cache plan", Annotations: planning}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpDiscoverInput) (*mcp.CallToolResult, mcpOperationResult, error) {
 		path, err := o.dataDirectory(in.Path)
 		if err != nil {
@@ -152,6 +192,10 @@ func (o *mcpOperations) server() *mcp.Server {
 	})
 	mcp.AddTool(server, &mcp.Tool{Name: "scan", Description: "Scan an allowed directory read-only and write private reports and a duplicate plan", Annotations: planning}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpScanInput) (*mcp.CallToolResult, mcpOperationResult, error) {
 		result, err := o.scan(ctx, in)
+		return mcpReply(result, err)
+	})
+	mcp.AddTool(server, &mcp.Tool{Name: "inventory_images", Description: "Inventory the fixed local image store and write private reports", Annotations: planning}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpPlanInput) (*mcp.CallToolResult, mcpOperationResult, error) {
+		result, err := o.inventoryImages(ctx, in)
 		return mcpReply(result, err)
 	})
 	mcp.AddTool(server, &mcp.Tool{Name: "plan_images", Description: "Plan unnamed unused images in the fixed owner store; no images removed", Annotations: planning}, func(ctx context.Context, _ *mcp.CallToolRequest, in mcpPlanInput) (*mcp.CallToolResult, mcpOperationResult, error) {
@@ -232,10 +276,16 @@ func (o *mcpOperations) scan(ctx context.Context, in mcpScanInput) (mcpOperation
 }
 
 func (o *mcpOperations) planImages(ctx context.Context, in mcpPlanInput) (mcpOperationResult, error) {
+	if o.options.engine == "docker" {
+		return mcpOperationResult{}, errors.New("docker image cleanup planning is unsupported; use inventory_images")
+	}
 	return o.run(ctx, "images-plan", false, in.Formats, "-owner", o.options.imageOwner, "-socket", o.options.imageSocket)
 }
 
 func (o *mcpOperations) cleanup(ctx context.Context, kind string, in mcpCleanupInput) (mcpOperationResult, error) {
+	if kind == "images" && o.options.engine == "docker" {
+		return mcpOperationResult{}, errors.New("docker image cleanup is unsupported")
+	}
 	if kind != "duplicates" && kind != "images" && kind != "caches" {
 		return mcpOperationResult{}, errors.New("unsupported cleanup kind")
 	}
@@ -294,7 +344,7 @@ func (o *mcpOperations) cleanup(ctx context.Context, kind string, in mcpCleanupI
 		}
 		for _, rows := range groups {
 			for _, row := range rows {
-				if !mcpWithin(o.options.root, row.path) || mcpWithin(o.options.out, row.path) {
+				if o.options.policy.excludes(row.path) || !mcpWithin(o.options.root, row.path) || mcpWithin(o.options.out, row.path) {
 					return mcpOperationResult{}, errors.New("duplicate plan contains a source outside the configured data root")
 				}
 				if _, err := plainPath(row.path, row.act == "dup"); err != nil {
@@ -311,7 +361,7 @@ func (o *mcpOperations) cleanup(ctx context.Context, kind string, in mcpCleanupI
 			return mcpOperationResult{}, errors.New("cache plan is outside the configured data root or invalid")
 		}
 		for _, target := range plan.Targets {
-			if !mcpWithin(o.options.root, target.Path) || mcpWithin(o.options.out, target.Path) {
+			if o.options.policy.overlaps(target.Path) || !mcpWithin(o.options.root, target.Path) || mcpWithin(o.options.out, target.Path) {
 				return mcpOperationResult{}, errors.New("cache target is outside the configured data root")
 			}
 			if _, err := plainPath(target.Path, true); err != nil {
@@ -360,19 +410,28 @@ func (o *mcpOperations) runIn(ctx context.Context, directory, command string, ex
 	if formats == "" {
 		formats = "json,jsonl,md"
 	}
-	for _, format := range strings.Split(formats, ",") {
-		if format != "json" && format != "jsonl" && format != "md" {
-			return mcpOperationResult{}, errors.New("formats must contain only json,jsonl,md")
-		}
+	parsedFormats, err := parseReportFormats(formats)
+	if err != nil {
+		return mcpOperationResult{}, err
 	}
+	formats = strings.Join(parsedFormats, ",")
 	if err := o.anchors(); err != nil {
 		return mcpOperationResult{}, err
+	}
+	if command == "scan" || command == "discover" || command == "cleanup" {
+		args = append(args, "-profile", o.options.policy.Profile)
+		for _, root := range o.options.policy.Protected {
+			args = append(args, "-protect", root)
+		}
 	}
 	args = append([]string{command}, args...)
 	args = append(args, "-out", directory, "-formats", formats)
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 	child := exec.CommandContext(ctx, o.executable, args...)
+	if command == "scan" {
+		child.Env = append(os.Environ(), "TMPDIR="+directory)
+	}
 	child.Cancel = func() error { return child.Process.Signal(syscall.SIGTERM) }
 	child.WaitDelay = 5 * time.Second
 	var stdout, stderr mcpBoundedBuffer
@@ -386,18 +445,29 @@ func (o *mcpOperations) runIn(ctx context.Context, directory, command string, ex
 		result.Summary = "cleanup dry run completed; no data removed"
 	}
 	entries, listErr := os.ReadDir(directory)
+	var retainedStages []string
 	if listErr == nil {
 		for _, entry := range entries {
+			if entry.IsDir() && strings.HasPrefix(entry.Name(), "tidyshare-reports-") {
+				path := filepath.Join(directory, entry.Name())
+				if info, err := plainPath(path, false); err == nil && info.IsDir() && info.Mode().Perm()&0o077 == 0 {
+					retainedStages = append(retainedStages, path)
+				}
+			}
 			if entry.Type().IsRegular() && entry.Name() != "reviewed-plan" {
 				result.Reports = append(result.Reports, filepath.Join(directory, entry.Name()))
 			}
 		}
 	}
+	diagnostic := "inspect private reports locally"
+	if len(retainedStages) > 0 {
+		diagnostic = "private partial reports retained at " + strings.Join(retainedStages, ", ")
+	}
 	if runErr != nil {
 		if ctx.Err() != nil {
-			return result, errors.New("operation cancelled or timed out; review private reports before retrying cleanup")
+			return result, fmt.Errorf("operation cancelled or timed out; %s; review reports before retrying cleanup", diagnostic)
 		}
-		return result, errors.New("operation failed; inspect private reports locally")
+		return result, fmt.Errorf("operation failed; %s", diagnostic)
 	}
 	if stdout.exceeded || stderr.exceeded {
 		return result, errors.New("operation output exceeded safety limit; inspect private reports locally")
@@ -423,4 +493,47 @@ func (b *mcpBoundedBuffer) Write(data []byte) (int, error) {
 	}
 	b.data = append(b.data, data...)
 	return count, nil
+}
+
+func (o *mcpOperations) inventoryImages(ctx context.Context, in mcpPlanInput) (mcpOperationResult, error) {
+	if err := o.anchors(); err != nil {
+		return mcpOperationResult{}, err
+	}
+	formatsValue := in.Formats
+	if formatsValue == "" {
+		formatsValue = "json,jsonl,md"
+	}
+	formats, err := parseReportFormats(formatsValue)
+	if err != nil {
+		return mcpOperationResult{}, err
+	}
+	var images []localImage
+	var summary, key string
+	if o.docker != nil {
+		images, summary, err = o.docker.inventory(ctx)
+		key = "docker:" + o.docker.Context
+	} else {
+		images, summary, err = listLocal(o.options.imageSocket, o.options.imageOwner)
+		key = o.options.imageOwner
+	}
+	if err != nil {
+		return mcpOperationResult{}, err
+	}
+	dir, err := o.newReportDir()
+	if err != nil {
+		return mcpOperationResult{}, err
+	}
+	r := imageReport{Local: images, SystemDF: map[string]string{key: summary}, Unavailable: map[string]string{}}
+	if err := writeImageReports(r, dir, formats); err != nil {
+		return mcpOperationResult{}, err
+	}
+	result := mcpOperationResult{Summary: "image inventory completed", ReportDir: dir, Reports: []string{}}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return result, err
+	}
+	for _, entry := range entries {
+		result.Reports = append(result.Reports, filepath.Join(dir, entry.Name()))
+	}
+	return result, nil
 }
