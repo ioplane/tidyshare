@@ -213,7 +213,7 @@ func buildBundle(source, out, version, commit string) (string, error) {
 	return destination, nil
 }
 
-func readBundleArchive(gz io.Reader, allowed map[string]bool) (map[string][]byte, error) {
+func readBundleArchive(gz io.Reader, allowed map[string]bool) (map[string][]byte, bool, error) {
 	tr := tar.NewReader(gz)
 	payload := map[string][]byte{}
 	rootSeen := false
@@ -225,11 +225,11 @@ func readBundleArchive(gz io.Reader, allowed map[string]bool) (map[string][]byte
 			break
 		}
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		name, err := validateBundleHeader(header, previous, rootSeen, allowed)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		previous = header.Name
 		if name == "" {
@@ -238,18 +238,15 @@ func readBundleArchive(gz io.Reader, allowed map[string]bool) (map[string][]byte
 		}
 		total += header.Size
 		if total > bundleTotalLimit {
-			return nil, errors.New("bundle payload exceeds size limit")
+			return nil, false, errors.New("bundle payload exceeds size limit")
 		}
 		data, err := io.ReadAll(tr)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		payload[name] = data
 	}
-	if !rootSeen || len(payload) != len(allowed) {
-		return nil, errors.New("bundle is incomplete")
-	}
-	return payload, nil
+	return payload, rootSeen, nil
 }
 
 func validateBundleHeader(header *tar.Header, previous string, rootSeen bool, allowed map[string]bool) (string, error) {
@@ -332,7 +329,7 @@ func verifyBundle(archive, version, commit string) error {
 	for _, name := range payloadFiles {
 		allowed[name] = true
 	}
-	payload, err := readBundleArchive(gz, allowed)
+	payload, rootSeen, err := readBundleArchive(gz, allowed)
 	if err != nil {
 		return err
 	}
@@ -346,6 +343,9 @@ func verifyBundle(archive, version, commit string) error {
 	}
 	if _, err := input.Peek(1); !errors.Is(err, io.EOF) {
 		return errors.New("unexpected data after gzip member")
+	}
+	if !rootSeen || len(payload) != len(allowed) {
+		return errors.New("bundle is incomplete")
 	}
 	return verifyBundleManifest(payload, allowed, version, commit)
 }

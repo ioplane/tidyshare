@@ -442,6 +442,24 @@ func corruptBundleArchive(entries []archiveEntry, kind string) []archiveEntry {
 	return entries
 }
 
+func TestIncompleteBundleStillRejectsTrailingGzipData(t *testing.T) {
+	original, err := buildBundle(bundleSource(t), t.TempDir(), "0.1.0", fixtureCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := tamperedArchive(t, readArchive(t, original)[:1])
+	data, err := os.ReadFile(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(archive, append(data, data...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyBundle(archive, "0.1.0", fixtureCommit); err == nil || !strings.Contains(err.Error(), "unexpected data after gzip member") {
+		t.Fatalf("gzip trailing data was masked by missing payload: %v", err)
+	}
+}
+
 func TestBundleRejectsCorruptOrUnsafeArchives(t *testing.T) {
 	original, err := buildBundle(bundleSource(t), t.TempDir(), "0.1.0", fixtureCommit)
 	if err != nil {
