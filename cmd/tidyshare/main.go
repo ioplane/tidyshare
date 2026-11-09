@@ -165,76 +165,12 @@ func runScan(args []string) int {
 }
 
 func runScanContext(ctx context.Context, args []string) int {
-	var o opts
-	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
-	profile, protected := policyFlags(fs)
-	skip := fs.String("skip", "", "comma-separated absolute dirs to skip")
-	fs.StringVar(&o.root, "root", "", "tree to scan (required)")
-	fs.StringVar(&o.out, "out", "tidyshare-report", "report directory; keep it off a nearly full share")
-	fs.Int64Var(&o.minSize, "min-size", 1<<20, "ignore files smaller than this for dedup")
-	fs.DurationVar(&o.settle, "settle", time.Hour, "skip files modified more recently (still being written)")
-	fs.IntVar(&o.staleDays, "stale-days", 180, "mtime older than this = cold")
-	fs.IntVar(&o.workers, "workers", 8, "parallel hashers")
-	fs.IntVar(&o.depth, "depth", 3, "directory summary depth under root")
-	fs.BoolVar(&o.images, "images", true, "scan container images and match image archives")
-	engine := fs.String("engine", "podman", "image inventory provider: podman or docker")
-	fs.StringVar(&o.dockerContext, "docker-context", "", "local Docker context")
-	imageSockets := fs.String("image-sockets", "", "comma-separated owner=unix:///path API sockets for requested image stores")
-	formats := fs.String("formats", "json,jsonl,md", "comma-separated report formats: json,jsonl,md; TSV plans are always retained")
-	fs.StringVar(&o.imageUsers, "image-users", "", "comma-separated rootless users whose storage is also listed")
-	fs.StringVar(&o.yaraRules, "yara-rules", "", "YARA rules file or directory (empty = no YARA scan)")
-	fs.StringVar(&o.yaraBin, "yara-bin", "yara", "classic yara CLI (needs --scan-list)")
-	fs.StringVar(&o.yaraCats, "yara-cats", "binary,installer,package,firmware,dump", "categories to scan with YARA")
-	fs.Int64Var(&o.yaraMax, "yara-max-size", 512<<20, "skip larger files in the YARA scan")
-	if err := fs.Parse(args); err != nil {
+	o, err := parseScanOptions(args)
+	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return fail(err)
-	}
-	if o.root == "" {
-		return fail(errors.New("-root is required"))
-	}
-	if o.workers <= 0 || o.minSize <= 0 || o.settle < 0 || o.staleDays < 0 || o.depth < 0 || fs.NArg() != 0 {
-		return fail(errors.New("workers and min-size must be positive; settle, stale-days and depth must be non-negative; no positional arguments"))
-	}
-	if *engine != "podman" && *engine != "docker" {
-		return fail(errors.New("-engine must be podman or docker"))
-	}
-	o.engine = *engine
-	var err error
-	o.policy, err = newStoragePolicy(*profile, *protected)
-	if err != nil {
-		return fail(err)
-	}
-	o.formats, err = parseReportFormats(*formats)
-	if err != nil {
-		return fail(err)
-	}
-	o.imageSockets, err = parseImageSockets(*imageSockets, o.imageUsers)
-	if err != nil {
-		return fail(err)
-	}
-	root, err := filepath.Abs(o.root)
-	if err != nil {
-		return fail(err)
-	}
-	st, err := os.Lstat(root)
-	if err != nil {
-		return fail(err)
-	}
-	if !st.IsDir() {
-		return fail(errors.New("root must be a directory, not a file or symlink"))
-	}
-	o.root = root
-	o.skip = map[string]bool{}
-	for _, s := range strings.Split(*skip, ",") {
-		if s != "" {
-			o.skip[filepath.Clean(s)] = true
-		}
-	}
-	if abs, err := filepath.Abs(o.out); err == nil {
-		o.skip[abs] = true
 	}
 	reportOut := o.out
 	stage, err := privateTemp("tidyshare-reports-")
@@ -260,11 +196,7 @@ func runScanContext(ctx context.Context, args []string) int {
 	}
 	fmt.Fprintf(os.Stderr, "scanned %d files\n", len(es))
 	detectMime(es, o.workers)
-	for _, e := range es {
-		if e.Mime == "unreadable" {
-			warnings = append(warnings, scanWarning{e.Path, "mime", "content unavailable"})
-		}
-	}
+	appendMimeWarnings(es, &warnings)
 	groups := findDups(es, o)
 	coverage, err := json.Marshal(map[string]any{"complete": len(warnings) == 0, "warnings": warnings})
 	if err != nil {
@@ -276,12 +208,9 @@ func runScanContext(ctx context.Context, args []string) int {
 	if err := writeReports(es, groups, o); err != nil {
 		return scanFailure(err)
 	}
-	var ir imageReport
-	if o.images {
-		ir = scanImages(es, o)
-		if err := writeImages(ir, o); err != nil {
-			return scanFailure(err)
-		}
+	ir, err := writeScanImages(es, o)
+	if err != nil {
+		return scanFailure(err)
 	}
 	if _, err := runYara(ctx, es, o); err != nil {
 		return scanFailure(err)
@@ -309,48 +238,12 @@ func walk(o opts) ([]entry, error) {
 	cutoff := time.Now().AddDate(0, 0, -o.staleDays).Unix()
 	var es []entry
 	err := filepath.WalkDir(o.root, func(p string, d fs.DirEntry, err error) error {
-		if o.policy.excludes(p) {
-			if d != nil && d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
+		if skip, walkErr := skipScanEntry(o, p, d, err); skip {
+			return walkErr
 		}
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "warn:", err)
-			if o.warnings != nil {
-				*o.warnings = append(*o.warnings, scanWarning{p, "walk", err.Error()})
-			}
-			if d != nil && d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
+		if e, ok := scanFileEntry(o, p, d, cutoff); ok {
+			es = append(es, e)
 		}
-		if d.IsDir() {
-			if o.skip[p] || o.policy.excludes(p) || (o.policy.Profile == "workstation" && cacheKind(p, true) != "") {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil {
-			if o.warnings != nil {
-				*o.warnings = append(*o.warnings, scanWarning{p, "stat", err.Error()})
-			}
-			return nil
-		}
-		st := info.Sys().(*syscall.Stat_t)
-		rel, _ := filepath.Rel(o.root, p)
-		area, _, _ := strings.Cut(rel, string(filepath.Separator))
-		e := entry{
-			Path: p, Area: area, Size: info.Size(), Allocated: st.Blocks * 512, Mtime: info.ModTime().Unix(),
-			Atime: fileAtime(info), Dev: uint64(st.Dev), Ino: st.Ino,
-		}
-		e.Cat = categorize(p)
-		e.Stale = staleReason(p, e, cutoff)
-		es = append(es, e)
 		return nil
 	})
 	return es, err
@@ -473,12 +366,7 @@ func regroup(groups [][]entry, h func(string, int64) ([16]byte, error), workers 
 				e := groups[j.gi][j.ei]
 				s, err := h(e.Path, e.Size)
 				if err != nil {
-					fmt.Fprintln(os.Stderr, "warn: hash:", err)
-					if warnings != nil {
-						mu.Lock()
-						*warnings = append(*warnings, scanWarning{e.Path, "hash", err.Error()})
-						mu.Unlock()
-					}
+					recordHashWarning(e.Path, err, warnings, &mu)
 					continue // unreadable file is dropped from dedup, never deleted
 				}
 				mu.Lock()
@@ -494,6 +382,10 @@ func regroup(groups [][]entry, h func(string, int64) ([16]byte, error), workers 
 	}
 	close(jobs)
 	wg.Wait()
+	return regroupBySums(groups, sums)
+}
+
+func regroupBySums(groups [][]entry, sums [][][16]byte) [][]entry {
 	var out [][]entry
 	for gi, g := range groups {
 		m := map[[16]byte][]entry{}
@@ -724,23 +616,7 @@ func writeSummary(es []entry, o opts, ng, nd int, reclaim int64, ns int, staleBy
 	fmt.Fprintf(w, "# %s report, %s\n\n- files: %d, bytes: %s\n- duplicate groups: %d, redundant files: %d, logical duplicate bytes: %s (min-size %s)\n- stale files (junk, or mtime older than %d d): %d, %s\n\n",
 		o.root, time.Now().Format("2006-01-02"), len(es), gib(total), ng, nd, gib(reclaim),
 		strconv.FormatInt(o.minSize>>20, 10)+" MiB", o.staleDays, ns, gib(staleBytes))
-	table := func(title string, m map[string]*agg, n int) {
-		keys := make([]string, 0, len(m))
-		for k := range m {
-			keys = append(keys, k)
-		}
-		sort.Slice(keys, func(i, j int) bool { return m[keys[i]].bytes > m[keys[j]].bytes })
-		fmt.Fprintf(w, "## %s\n\n| name | files | size | dominant category | newest mtime |\n|:---|---:|---:|:---|:---|\n", title)
-		for i, k := range keys {
-			if i == n {
-				break
-			}
-			a := m[k]
-			fmt.Fprintf(w, "| %s | %d | %s | %s | %s |\n", k, a.files, gib(a.bytes), a.top(),
-				time.Unix(a.newest, 0).UTC().Format("2006-01-02"))
-		}
-		fmt.Fprintln(w)
-	}
+	table := func(title string, m map[string]*agg, n int) { writeSummaryTable(w, title, m, n) }
 	cut := time.Now().AddDate(0, 0, -o.staleDays).Unix()
 	cold := map[string]*agg{}
 	for k, a := range dirs {
@@ -1045,4 +921,182 @@ func sameDev(p string, q os.FileInfo) bool {
 	}
 	st, err := os.Lstat(p)
 	return err == nil && st.Sys().(*syscall.Stat_t).Dev == q.Sys().(*syscall.Stat_t).Dev
+}
+
+func prepareScanPaths(o *opts, skip string) error {
+	root, err := filepath.Abs(o.root)
+	if err != nil {
+		return err
+	}
+	st, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if !st.IsDir() {
+		return errors.New("root must be a directory, not a file or symlink")
+	}
+	o.root = root
+	o.skip = map[string]bool{}
+	for _, s := range strings.Split(skip, ",") {
+		if s != "" {
+			o.skip[filepath.Clean(s)] = true
+		}
+	}
+	if abs, err := filepath.Abs(o.out); err == nil {
+		o.skip[abs] = true
+	}
+	return nil
+}
+
+func scanFileEntry(o opts, p string, d fs.DirEntry, cutoff int64) (entry, bool) {
+	info, err := d.Info()
+	if err != nil {
+		if o.warnings != nil {
+			*o.warnings = append(*o.warnings, scanWarning{p, "stat", err.Error()})
+		}
+		return entry{}, false
+	}
+	st := info.Sys().(*syscall.Stat_t)
+	rel, _ := filepath.Rel(o.root, p)
+	area, _, _ := strings.Cut(rel, string(filepath.Separator))
+	e := entry{
+		Path: p, Area: area, Size: info.Size(), Allocated: st.Blocks * 512, Mtime: info.ModTime().Unix(),
+		Atime: fileAtime(info), Dev: uint64(st.Dev), Ino: st.Ino,
+	}
+	e.Cat = categorize(p)
+	e.Stale = staleReason(p, e, cutoff)
+	return e, true
+}
+
+func writeSummaryTable(w io.Writer, title string, m map[string]*agg, n int) {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return m[keys[i]].bytes > m[keys[j]].bytes })
+	fmt.Fprintf(w, "## %s\n\n| name | files | size | dominant category | newest mtime |\n|:---|---:|---:|:---|:---|\n", title)
+	for i, k := range keys {
+		if i == n {
+			break
+		}
+		a := m[k]
+		fmt.Fprintf(w, "| %s | %d | %s | %s | %s |\n", k, a.files, gib(a.bytes), a.top(),
+			time.Unix(a.newest, 0).UTC().Format("2006-01-02"))
+	}
+	fmt.Fprintln(w)
+}
+
+func parseScanOptions(args []string) (opts, error) {
+	var o opts
+	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
+	profile, protected := policyFlags(fs)
+	skip := fs.String("skip", "", "comma-separated absolute dirs to skip")
+	fs.StringVar(&o.root, "root", "", "tree to scan (required)")
+	fs.StringVar(&o.out, "out", "tidyshare-report", "report directory; keep it off a nearly full share")
+	fs.Int64Var(&o.minSize, "min-size", 1<<20, "ignore files smaller than this for dedup")
+	fs.DurationVar(&o.settle, "settle", time.Hour, "skip files modified more recently (still being written)")
+	fs.IntVar(&o.staleDays, "stale-days", 180, "mtime older than this = cold")
+	fs.IntVar(&o.workers, "workers", 8, "parallel hashers")
+	fs.IntVar(&o.depth, "depth", 3, "directory summary depth under root")
+	fs.BoolVar(&o.images, "images", true, "scan container images and match image archives")
+	engine := fs.String("engine", "podman", "image inventory provider: podman or docker")
+	fs.StringVar(&o.dockerContext, "docker-context", "", "local Docker context")
+	imageSockets := fs.String("image-sockets", "", "comma-separated owner=unix:///path API sockets for requested image stores")
+	formats := fs.String("formats", "json,jsonl,md", "comma-separated report formats: json,jsonl,md; TSV plans are always retained")
+	fs.StringVar(&o.imageUsers, "image-users", "", "comma-separated rootless users whose storage is also listed")
+	fs.StringVar(&o.yaraRules, "yara-rules", "", "YARA rules file or directory (empty = no YARA scan)")
+	fs.StringVar(&o.yaraBin, "yara-bin", "yara", "classic yara CLI (needs --scan-list)")
+	fs.StringVar(&o.yaraCats, "yara-cats", "binary,installer,package,firmware,dump", "categories to scan with YARA")
+	fs.Int64Var(&o.yaraMax, "yara-max-size", 512<<20, "skip larger files in the YARA scan")
+	if err := fs.Parse(args); err != nil {
+		return o, err
+	}
+	if o.root == "" {
+		return o, errors.New("-root is required")
+	}
+	if o.workers <= 0 || o.minSize <= 0 || o.settle < 0 || o.staleDays < 0 || o.depth < 0 || fs.NArg() != 0 {
+		return o, errors.New("workers and min-size must be positive; settle, stale-days and depth must be non-negative; no positional arguments")
+	}
+	if *engine != "podman" && *engine != "docker" {
+		return o, errors.New("-engine must be podman or docker")
+	}
+	o.engine = *engine
+	var err error
+	o.policy, err = newStoragePolicy(*profile, *protected)
+	if err != nil {
+		return o, err
+	}
+	o.formats, err = parseReportFormats(*formats)
+	if err != nil {
+		return o, err
+	}
+	o.imageSockets, err = parseImageSockets(*imageSockets, o.imageUsers)
+	if err != nil {
+		return o, err
+	}
+	if err := prepareScanPaths(&o, *skip); err != nil {
+		return o, err
+	}
+	return o, nil
+}
+
+func skipScanEntry(o opts, p string, d fs.DirEntry, err error) (bool, error) {
+	if o.policy.excludes(p) {
+		return true, skipScanDirectory(d)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "warn:", err)
+		if o.warnings != nil {
+			*o.warnings = append(*o.warnings, scanWarning{p, "walk", err.Error()})
+		}
+		if d != nil && d.IsDir() {
+			return true, fs.SkipDir
+		}
+		return true, nil
+	}
+	if d.IsDir() {
+		if o.skip[p] || o.policy.excludes(p) || (o.policy.Profile == "workstation" && cacheKind(p, true) != "") {
+			return true, fs.SkipDir
+		}
+		return true, nil
+	}
+	if !d.Type().IsRegular() {
+		return true, nil
+	}
+	return false, nil
+}
+
+func appendMimeWarnings(es []entry, warnings *[]scanWarning) {
+	for _, e := range es {
+		if e.Mime == "unreadable" {
+			*warnings = append(*warnings, scanWarning{e.Path, "mime", "content unavailable"})
+		}
+	}
+}
+
+func writeScanImages(es []entry, o opts) (imageReport, error) {
+	var ir imageReport
+	if o.images {
+		ir = scanImages(es, o)
+		if err := writeImages(ir, o); err != nil {
+			return ir, err
+		}
+	}
+	return ir, nil
+}
+
+func recordHashWarning(path string, err error, warnings *[]scanWarning, mu *sync.Mutex) {
+	fmt.Fprintln(os.Stderr, "warn: hash:", err)
+	if warnings != nil {
+		mu.Lock()
+		*warnings = append(*warnings, scanWarning{path, "hash", err.Error()})
+		mu.Unlock()
+	}
+}
+
+func skipScanDirectory(d fs.DirEntry) error {
+	if d != nil && d.IsDir() {
+		return fs.SkipDir
+	}
+	return nil
 }

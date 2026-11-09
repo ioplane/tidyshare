@@ -60,16 +60,7 @@ func TestWorkstationInventoryBoundedAccounting(t *testing.T) {
 	if !found || r.SchemaVersion != 1 || r.Operation != "workstation" || len(r.Filesystems) != 1 {
 		t.Fatalf("report: %+v", r)
 	}
-	for _, name := range []string{"workstation.json", "workstation.md"} {
-		st, err := os.Stat(filepath.Join(out, name))
-		if err != nil || st.Mode().Perm() != 0o600 {
-			t.Fatalf("private file %s: %v %v", name, st, err)
-		}
-	}
-	st, err := os.Stat(out)
-	if err != nil || st.Mode().Perm() != 0o700 {
-		t.Fatal("report directory not private")
-	}
+	checkPrivateWorkstationReports(t, out)
 }
 
 // Removing the application-data policy must expose an environment-selected cache.
@@ -322,5 +313,19 @@ func TestWorkstationProposesManagedPlanningWithoutCleanupAuthorization(t *testin
 				t.Fatal("uv execution route proposed")
 			}
 		}
+	}
+}
+
+func checkPrivateWorkstationReports(t *testing.T, out string) {
+	t.Helper()
+	for _, name := range []string{"workstation.json", "workstation.md"} {
+		st, err := os.Stat(filepath.Join(out, name))
+		if err != nil || st.Mode().Perm() != 0o600 {
+			t.Fatalf("private file %s: %v %v", name, st, err)
+		}
+	}
+	st, err := os.Stat(out)
+	if err != nil || st.Mode().Perm() != 0o700 {
+		t.Fatal("report directory not private")
 	}
 }

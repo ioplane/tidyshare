@@ -103,10 +103,7 @@ func runCleanup(args []string) int {
 		}
 		return fail(err)
 	}
-	if (*kind != "duplicates" && *kind != "images" && *kind != "caches") || *plan == "" || *out == "" || *limit < 0 || f.NArg() != 0 {
-		return fail(errors.New("-kind duplicates|images|caches, -plan and -out are required; limit must be non-negative; no positional arguments"))
-	}
-	formats, err := parseReportFormats(*format)
+	formats, err := cleanupReportFormats(*kind, *plan, *out, *limit, f.NArg(), *format)
 	if err != nil {
 		return fail(err)
 	}
@@ -125,23 +122,12 @@ func runCleanup(args []string) int {
 	case "caches":
 		caches, err = readCachePlan(*plan)
 		if err == nil {
-			for _, target := range caches.Targets {
-				if policy.overlaps(target.Path) {
-					return fail(errors.New("cache target overlaps a protected root"))
-				}
-			}
-			err = cachePlanLocations(caches, *plan, *out)
+			err = validateCleanupCacheLocations(caches, policy, *plan, *out)
 		}
 	default:
 		duplicateGroups, duplicateOrder, err = readDuplicatePlan(*plan)
 		if err == nil {
-			for _, rows := range duplicateGroups {
-				for _, r := range rows {
-					if policy.excludes(r.path) {
-						return fail(errors.New("duplicate target is protected"))
-					}
-				}
-			}
+			err = validateCleanupDuplicatePolicy(duplicateGroups, policy)
 		}
 	}
 	if err != nil {
@@ -223,4 +209,35 @@ func runImagePlan(args []string) int {
 	}
 	fmt.Fprintf(os.Stderr, "image cleanup plan in %s/image-plan.json\n", *out)
 	return 0
+}
+
+func validateCleanupCacheLocations(plan cachePlan, policy storagePolicy, source, out string) error {
+	for _, target := range plan.Targets {
+		if policy.overlaps(target.Path) {
+			return errors.New("cache target overlaps a protected root")
+		}
+	}
+	return cachePlanLocations(plan, source, out)
+}
+
+func validateCleanupDuplicatePolicy(groups map[string][]row, policy storagePolicy) error {
+	for _, rows := range groups {
+		for _, r := range rows {
+			if policy.excludes(r.path) {
+				return errors.New("duplicate target is protected")
+			}
+		}
+	}
+	return nil
+}
+
+func cleanupReportFormats(kind, plan, out string, limit, narg int, format string) ([]string, error) {
+	if (kind != "duplicates" && kind != "images" && kind != "caches") || plan == "" || out == "" || limit < 0 || narg != 0 {
+		return nil, errors.New("-kind duplicates|images|caches, -plan and -out are required; limit must be non-negative; no positional arguments")
+	}
+	formats, err := parseReportFormats(format)
+	if err != nil {
+		return nil, err
+	}
+	return formats, nil
 }

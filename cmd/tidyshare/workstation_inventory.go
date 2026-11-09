@@ -162,203 +162,13 @@ func collectWorkstation(ctx context.Context, o workstationOptions) (r workstatio
 	sort.Strings(r.Policy.Protected)
 	r.Policy.Protected = uniqueStrings(r.Policy.Protected)
 	sort.Strings(r.ProjectRoots)
-	for i, path := range r.ProjectRoots {
-		if !filepath.IsAbs(path) || filepath.Clean(path) != path || !cacheWithin(o.Root, path) || r.Policy.overlaps(path) && r.Policy.excludes(path) {
-			return r, errors.New("project root is outside the anchor or protected")
-		}
-		for _, ancestor := range r.ProjectRoots[:i] {
-			if cacheWithin(ancestor, path) || cacheWithin(path, ancestor) {
-				return r, errors.New("project roots overlap")
-			}
-		}
-		if st, err := plainPath(path, false); err != nil || !st.IsDir() {
-			return r, errors.New("project root has unsafe or unavailable components")
-		}
+	if err := validateWorkstationProjects(o.Root, r.ProjectRoots, r.Policy); err != nil {
+		return r, err
 	}
-	r.Complete = true
-	warn := func(reason string) {
-		r.Complete = false
-		if len(r.Warnings) < 1000 {
-			r.Warnings = append(r.Warnings, reason)
-		}
-	}
-	devices := map[uint64]bool{}
-	observeFS := func(path string, device uint64) {
-		if devices[device] {
-			return
-		}
-		devices[device] = true
-		fs := workstationFilesystem{Device: device, Path: path, BudgetBytes: o.MinFreeBytes}
-		var st unix.Statfs_t
-		if err := unix.Statfs(path, &st); err != nil {
-			fs.Reason = err.Error()
-			warn(path + ": filesystem observation unavailable")
-		} else if uint64(st.Bavail) > math.MaxUint64/uint64(st.Bsize) {
-			fs.Reason = "filesystem byte count overflows"
-			warn(fs.Reason)
-		} else {
-			free := uint64(st.Bavail) * uint64(st.Bsize)
-			fs.AvailableBytes = &free
-			if o.MinFreeBytes != 0 {
-				below := free < o.MinFreeBytes
-				fs.BelowBudget = &below
-			}
-		}
-		r.Filesystems = append(r.Filesystems, fs)
-	}
-	observeFS(o.Root, uint64(rootStat.Dev))
-	paths := map[string]string{}
-	for _, layout := range cacheLayouts {
-		if runtime.GOOS != "darwin" && strings.HasPrefix(layout.suffix, "Library/") {
-			continue
-		}
-		paths[filepath.Join(o.Root, layout.suffix)] = layout.kind
-	}
-	if runtime.GOOS == "darwin" {
-		paths[filepath.Join(o.Root, "Library/Caches/Google/Chrome")] = "chrome"
-	}
-	// Only recognized current environment settings can supply additional cache roots.
-	for _, key := range []string{"GOCACHE", "GOMODCACHE", "PIP_CACHE_DIR", "UV_CACHE_DIR", "NPM_CONFIG_CACHE", "npm_config_cache", "CARGO_HOME", "GRADLE_USER_HOME", "NUGET_PACKAGES", "NUGET_HTTP_CACHE_PATH", "XDG_CACHE_HOME", "XDG_DATA_HOME", "GOPATH"} {
-		for _, base := range filepath.SplitList(os.Getenv(key)) {
-			if !filepath.IsAbs(base) {
-				continue
-			}
-			candidates := []string{base, filepath.Join(base, "_cacache"), filepath.Join(base, "pkg/mod")}
-			for _, layout := range cacheLayouts {
-				candidates = append(candidates, filepath.Join(base, filepath.Base(layout.suffix)))
-			}
-			candidates = append(candidates, filepath.Join(base, "registry/cache"), filepath.Join(base, "caches"), filepath.Join(base, "pnpm/store"), filepath.Join(base, "NuGet/v3-cache"))
-			for _, path := range candidates {
-				if cacheWithin(o.Root, path) {
-					if kind := cacheKind(path, false); kind != "" {
-						paths[path] = kind
-					}
-				}
-			}
-		}
-	}
-	for _, path := range r.ProjectRoots {
-		if ctx.Err() != nil {
-			break
-		}
-		project, err := openPlainDirectory(path, false)
-		if err != nil {
-			warn(path + ": " + err.Error())
-			continue
-		}
-		var st unix.Stat_t
-		err = unix.Fstat(int(project.Fd()), &st)
-		_ = project.Close()
-		if err != nil {
-			warn(path + ": " + err.Error())
-			continue
-		}
-		observeFS(path, uint64(st.Dev))
-		d, err := discoverStorageWithPolicy(ctx, path, "", r.Policy)
-		r.GitTrees = append(r.GitTrees, d.GitTrees...)
-		for _, w := range d.Warnings {
-			warn(w)
-		}
-		if err != nil {
-			warn(path + ": " + err.Error())
-		}
-		for _, c := range d.Caches {
-			paths[c.Path] = c.Kind
-		}
-	}
-	ordered := make([]string, 0, len(paths))
-	for path := range paths {
-		ordered = append(ordered, path)
-	}
-	sort.Strings(ordered)
-	for _, path := range ordered {
-		c := workstationCategory{Kind: paths[path], Path: path, State: "absent", Operation: "inventory_only"}
-		switch c.Kind {
-		case "go_build", "npm", "homebrew", "chrome", "xcode":
-			c.Operation = "managed_plan"
-		}
-		if r.Policy.overlaps(path) {
-			c.State = "protected"
-			c.Reason = "storage policy excludes this target"
-			r.Categories = append(r.Categories, c)
-			continue
-		}
-		if err := ctx.Err(); err != nil {
-			c.State = "partial"
-			c.Reason = err.Error()
-			warn(c.Reason)
-			r.Categories = append(r.Categories, c)
-			continue
-		}
-		if _, err := plainPath(path, false); errors.Is(err, os.ErrNotExist) {
-			r.Categories = append(r.Categories, c)
-			continue
-		}
-		dir, err := openPlainDirectory(path, false)
-		if err != nil {
-			c.State = "partial"
-			c.Reason = err.Error()
-			warn(path + ": " + c.Reason)
-			r.Categories = append(r.Categories, c)
-			continue
-		}
-		var st unix.Stat_t
-		err = unix.Fstat(int(dir.Fd()), &st)
-		if err == nil {
-			c.Device, c.Inode = uint64(st.Dev), st.Ino
-			observeFS(path, c.Device)
-			var logical, allocated int64
-			seen := map[[2]uint64]bool{}
-			_, _, err = cacheWalk(ctx, dir, c.Device, func(_ *os.File, _ string, s unix.Stat_t) error {
-				if s.Mode&unix.S_IFMT != unix.S_IFREG {
-					return nil
-				}
-				c.Files++
-				key := [2]uint64{uint64(s.Dev), s.Ino}
-				if seen[key] {
-					return nil
-				}
-				seen[key] = true
-				if s.Size < 0 || s.Blocks < 0 || s.Blocks > math.MaxInt64/512 || logical > math.MaxInt64-s.Size || allocated > math.MaxInt64-s.Blocks*512 {
-					return errors.New("category byte count overflows")
-				}
-				logical += s.Size
-				allocated += s.Blocks * 512
-				return nil
-			})
-			if err == nil {
-				c.LogicalBytes = &logical
-				c.AllocatedBytes = &allocated
-				c.State = "complete"
-			}
-		}
-		_ = dir.Close()
-		if err != nil {
-			c.State = "partial"
-			c.Reason = err.Error()
-			warn(path + ": " + c.Reason)
-		}
-		r.Categories = append(r.Categories, c)
-	}
-	sort.SliceStable(r.Categories, func(i, j int) bool {
-		a, b := r.Categories[i], r.Categories[j]
-		if a.AllocatedBytes == nil {
-			return false
-		}
-		if b.AllocatedBytes == nil {
-			return true
-		}
-		return *a.AllocatedBytes > *b.AllocatedBytes
-	})
-	if o.Runtime != nil {
-		r.Runtime, err = o.Runtime.observe(ctx)
-		if err != nil {
-			warn(err.Error())
-		}
-	}
+	collectWorkstationObservations(ctx, o, &r)
 	compareWorkstation(&r, o.Previous)
 	if err := ctx.Err(); err != nil {
-		warn(err.Error())
+		workstationWarning(&r, err.Error())
 		return r, err
 	}
 	if !r.Complete {
@@ -377,7 +187,7 @@ func uniqueStrings(values []string) []string {
 	return out
 }
 
-func compareWorkstation(r *workstationReport, previous *workstationReport) {
+func compareWorkstation(r, previous *workstationReport) {
 	if previous == nil {
 		return
 	}
@@ -386,28 +196,8 @@ func compareWorkstation(r *workstationReport, previous *workstationReport) {
 		return
 	}
 	r.Comparison = workstationComparison{Compatible: true, Reason: "compatible observations; changes are not attributed to cleanup"}
-	for i := range r.Categories {
-		c := &r.Categories[i]
-		for _, p := range previous.Categories {
-			if c.Path == p.Path && c.Kind == p.Kind && c.Device == p.Device && c.Inode == p.Inode && c.State == "complete" && p.State == "complete" && c.LogicalBytes != nil && p.LogicalBytes != nil && c.AllocatedBytes != nil && p.AllocatedBytes != nil && *c.LogicalBytes >= 0 && *p.LogicalBytes >= 0 && *c.AllocatedBytes >= 0 && *p.AllocatedBytes >= 0 {
-				d := *c.LogicalBytes - *p.LogicalBytes
-				a := *c.AllocatedBytes - *p.AllocatedBytes
-				c.LogicalDelta = &d
-				c.AllocatedDelta = &a
-				break
-			}
-		}
-	}
-	for i := range r.Filesystems {
-		f := &r.Filesystems[i]
-		for _, p := range previous.Filesystems {
-			if f.Device == p.Device && f.AvailableBytes != nil && p.AvailableBytes != nil && *f.AvailableBytes <= math.MaxInt64 && *p.AvailableBytes <= math.MaxInt64 {
-				d := int64(*f.AvailableBytes) - int64(*p.AvailableBytes)
-				f.AvailableDelta = &d
-				break
-			}
-		}
-	}
+	compareWorkstationCategories(r.Categories, previous.Categories)
+	compareWorkstationFilesystems(r.Filesystems, previous.Filesystems)
 }
 
 func readWorkstationPrevious(path string) (*workstationReport, error) {
@@ -435,7 +225,7 @@ func readWorkstationPrevious(path string) (*workstationReport, error) {
 		return nil, err
 	}
 	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
+	if decoder.Decode(&extra) != io.EOF {
 		return nil, errors.New("previous report contains trailing data")
 	}
 	return &r, nil
@@ -527,64 +317,18 @@ func runWorkstation(args []string) int {
 	if cacheWithin(*out, o.Root) {
 		return fail(errors.New("report directory must not contain the data root"))
 	}
-	for _, path := range projects {
-		p, err := filepath.Abs(path)
-		if err != nil {
-			return fail(err)
-		}
-		if cacheWithin(p, *out) || cacheWithin(*out, p) {
-			return fail(errors.New("report directory overlaps a project root"))
-		}
-		o.ProjectRoots = append(o.ProjectRoots, p)
-	}
-	for _, layout := range cacheLayouts {
-		p := filepath.Join(o.Root, layout.suffix)
-		if cacheWithin(p, *out) || cacheWithin(*out, p) {
-			return fail(errors.New("report directory overlaps a cache root"))
-		}
-	}
-	if _, err := plainPath(*out, true); err != nil {
+	if err := prepareWorkstationPaths(&o, projects, *out); err != nil {
 		return fail(err)
 	}
-	if st, err := os.Stat(*out); err == nil {
-		entries, e := os.ReadDir(*out)
-		if e != nil || !st.IsDir() || st.Mode().Perm()&0o077 != 0 || len(entries) != 0 {
-			return fail(errors.New("report directory must be new or empty and private"))
-		}
-	}
-	if *profile == "" {
-		*profile = "workstation"
-	}
-	o.Policy = storagePolicy{Profile: *profile, Protected: *protected}
-	if *previous != "" {
-		o.Previous, err = readWorkstationPrevious(*previous)
-		if err != nil {
-			return fail(err)
-		}
-	}
-	if *engine != "" && *engine != "docker" && *engine != "podman" {
-		return fail(errors.New("engine must be docker or podman"))
-	}
-	if *dockerContext != "" && *engine != "docker" {
-		return fail(errors.New("docker-context requires engine=docker"))
+	if err := configureWorkstationOptions(&o, *profile, *protected, *previous, *engine, *dockerContext); err != nil {
+		return fail(err)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	if *engine != "" {
-		o.Runtime = &workstationRuntimeSource{Engine: *engine}
-		if *engine == "docker" {
-			o.Runtime.Docker, err = resolveDockerStore(ctx, *dockerContext)
-			// Preserve current filesystem observations when the optional daemon is unavailable.
-			if err != nil {
-				o.Runtime.Docker = nil
-			}
-		}
-	}
+	o.Runtime = configureWorkstationRuntime(ctx, *engine, *dockerContext)
 	r, scanErr := collectWorkstation(ctx, o)
-	for _, c := range r.Categories {
-		if cacheWithin(c.Path, *out) || cacheWithin(*out, c.Path) {
-			return fail(errors.New("report directory overlaps an inventory category"))
-		}
+	if err := validateWorkstationCategoryOutput(*out, r.Categories); err != nil {
+		return fail(err)
 	}
 	if err := writeWorkstationReports(*out, r); err != nil {
 		return fail(errors.Join(scanErr, err))
@@ -593,4 +337,339 @@ func runWorkstation(args []string) int {
 		return fail(scanErr)
 	}
 	return 0
+}
+
+func validateWorkstationProjects(root string, projects []string, policy storagePolicy) error {
+	for i, path := range projects {
+		if !filepath.IsAbs(path) || filepath.Clean(path) != path || !cacheWithin(root, path) || policy.overlaps(path) && policy.excludes(path) {
+			return errors.New("project root is outside the anchor or protected")
+		}
+		for _, ancestor := range projects[:i] {
+			if cacheWithin(ancestor, path) || cacheWithin(path, ancestor) {
+				return errors.New("project roots overlap")
+			}
+		}
+		if st, err := plainPath(path, false); err != nil || !st.IsDir() {
+			return errors.New("project root has unsafe or unavailable components")
+		}
+	}
+	return nil
+}
+
+func observeWorkstationFilesystem(path string, device, budget uint64, warn func(string)) workstationFilesystem {
+	fs := workstationFilesystem{Device: device, Path: path, BudgetBytes: budget}
+	var st unix.Statfs_t
+	if err := unix.Statfs(path, &st); err != nil {
+		fs.Reason = err.Error()
+		warn(path + ": filesystem observation unavailable")
+	} else if uint64(st.Bavail) > math.MaxUint64/uint64(st.Bsize) {
+		fs.Reason = "filesystem byte count overflows"
+		warn(fs.Reason)
+	} else {
+		free := uint64(st.Bavail) * uint64(st.Bsize)
+		fs.AvailableBytes = &free
+		if budget != 0 {
+			below := free < budget
+			fs.BelowBudget = &below
+		}
+	}
+	return fs
+}
+
+func workstationCachePaths(root string) map[string]string {
+	paths := map[string]string{}
+	for _, layout := range cacheLayouts {
+		if runtime.GOOS != "darwin" && strings.HasPrefix(layout.suffix, "Library/") {
+			continue
+		}
+		paths[filepath.Join(root, layout.suffix)] = layout.kind
+	}
+	if runtime.GOOS == "darwin" {
+		paths[filepath.Join(root, "Library/Caches/Google/Chrome")] = "chrome"
+	}
+	addWorkstationEnvironmentCaches(root, paths)
+	return paths
+}
+
+func addWorkstationEnvironmentCaches(root string, paths map[string]string) {
+	// Only recognized current environment settings can supply additional cache roots.
+	for _, key := range []string{"GOCACHE", "GOMODCACHE", "PIP_CACHE_DIR", "UV_CACHE_DIR", "NPM_CONFIG_CACHE", "npm_config_cache", "CARGO_HOME", "GRADLE_USER_HOME", "NUGET_PACKAGES", "NUGET_HTTP_CACHE_PATH", "XDG_CACHE_HOME", "XDG_DATA_HOME", "GOPATH"} {
+		for _, base := range filepath.SplitList(os.Getenv(key)) {
+			if !filepath.IsAbs(base) {
+				continue
+			}
+			addWorkstationEnvironmentBase(root, base, paths)
+		}
+	}
+}
+
+func discoverWorkstationProjects(ctx context.Context, r *workstationReport, paths map[string]string, observeFS func(string, uint64), warn func(string)) {
+	for _, path := range r.ProjectRoots {
+		if ctx.Err() != nil {
+			break
+		}
+		project, err := openPlainDirectory(path, false)
+		if err != nil {
+			warn(path + ": " + err.Error())
+			continue
+		}
+		var st unix.Stat_t
+		err = unix.Fstat(int(project.Fd()), &st)
+		_ = project.Close()
+		if err != nil {
+			warn(path + ": " + err.Error())
+			continue
+		}
+		observeFS(path, uint64(st.Dev))
+		d, err := discoverStorageWithPolicy(ctx, path, "", r.Policy)
+		r.GitTrees = append(r.GitTrees, d.GitTrees...)
+		for _, w := range d.Warnings {
+			warn(w)
+		}
+		if err != nil {
+			warn(path + ": " + err.Error())
+		}
+		for _, c := range d.Caches {
+			paths[c.Path] = c.Kind
+		}
+	}
+}
+
+func observeWorkstationCategory(ctx context.Context, path, kind string, policy storagePolicy, observeFS func(string, uint64), warn func(string)) workstationCategory {
+	c := workstationCategory{Kind: kind, Path: path, State: "absent", Operation: "inventory_only"}
+	switch c.Kind {
+	case "go_build", "npm", "homebrew", "chrome", "xcode":
+		c.Operation = "managed_plan"
+	}
+	if policy.overlaps(path) {
+		c.State = "protected"
+		c.Reason = "storage policy excludes this target"
+		return c
+	}
+	if err := ctx.Err(); err != nil {
+		c.State = "partial"
+		c.Reason = err.Error()
+		warn(c.Reason)
+		return c
+	}
+	if _, err := plainPath(path, false); errors.Is(err, os.ErrNotExist) {
+		return c
+	}
+	dir, err := openPlainDirectory(path, false)
+	if err != nil {
+		c.State = "partial"
+		c.Reason = err.Error()
+		warn(path + ": " + c.Reason)
+		return c
+	}
+	var st unix.Stat_t
+	err = unix.Fstat(int(dir.Fd()), &st)
+	if err == nil {
+		c.Device, c.Inode = uint64(st.Dev), st.Ino
+		observeFS(path, c.Device)
+		err = measureWorkstationCategory(ctx, dir, &c)
+	}
+	_ = dir.Close()
+	if err != nil {
+		c.State = "partial"
+		c.Reason = err.Error()
+		warn(path + ": " + c.Reason)
+	}
+	return c
+}
+
+func measureWorkstationCategory(ctx context.Context, dir *os.File, c *workstationCategory) error {
+	var err error
+	var logical, allocated int64
+	seen := map[[2]uint64]bool{}
+	_, _, err = cacheWalk(ctx, dir, c.Device, func(_ *os.File, _ string, s unix.Stat_t) error {
+		if s.Mode&unix.S_IFMT != unix.S_IFREG {
+			return nil
+		}
+		c.Files++
+		key := [2]uint64{uint64(s.Dev), s.Ino}
+		if seen[key] {
+			return nil
+		}
+		seen[key] = true
+		if s.Size < 0 || s.Blocks < 0 || s.Blocks > math.MaxInt64/512 || logical > math.MaxInt64-s.Size || allocated > math.MaxInt64-s.Blocks*512 {
+			return errors.New("category byte count overflows")
+		}
+		logical += s.Size
+		allocated += s.Blocks * 512
+		return nil
+	})
+	if err == nil {
+		c.LogicalBytes = &logical
+		c.AllocatedBytes = &allocated
+		c.State = "complete"
+	}
+	return err
+}
+
+func compareWorkstationCategories(categories, previous []workstationCategory) {
+	for i := range categories {
+		c := &categories[i]
+		for _, p := range previous {
+			if c.Path == p.Path && c.Kind == p.Kind && c.Device == p.Device && c.Inode == p.Inode && c.State == "complete" && p.State == "complete" && c.LogicalBytes != nil && p.LogicalBytes != nil && c.AllocatedBytes != nil && p.AllocatedBytes != nil && *c.LogicalBytes >= 0 && *p.LogicalBytes >= 0 && *c.AllocatedBytes >= 0 && *p.AllocatedBytes >= 0 {
+				d := *c.LogicalBytes - *p.LogicalBytes
+				a := *c.AllocatedBytes - *p.AllocatedBytes
+				c.LogicalDelta = &d
+				c.AllocatedDelta = &a
+				break
+			}
+		}
+	}
+}
+
+func compareWorkstationFilesystems(filesystems, previous []workstationFilesystem) {
+	for i := range filesystems {
+		f := &filesystems[i]
+		for _, p := range previous {
+			if f.Device == p.Device && f.AvailableBytes != nil && p.AvailableBytes != nil && *f.AvailableBytes <= math.MaxInt64 && *p.AvailableBytes <= math.MaxInt64 {
+				d := int64(*f.AvailableBytes) - int64(*p.AvailableBytes)
+				f.AvailableDelta = &d
+				break
+			}
+		}
+	}
+}
+
+func prepareWorkstationPaths(o *workstationOptions, projects []string, out string) error {
+	for _, path := range projects {
+		p, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		if cacheWithin(p, out) || cacheWithin(out, p) {
+			return errors.New("report directory overlaps a project root")
+		}
+		o.ProjectRoots = append(o.ProjectRoots, p)
+	}
+	for _, layout := range cacheLayouts {
+		p := filepath.Join(o.Root, layout.suffix)
+		if cacheWithin(p, out) || cacheWithin(out, p) {
+			return errors.New("report directory overlaps a cache root")
+		}
+	}
+	if _, err := plainPath(out, true); err != nil {
+		return err
+	}
+	if st, err := os.Stat(out); err == nil {
+		entries, e := os.ReadDir(out)
+		if e != nil || !st.IsDir() || st.Mode().Perm()&0o077 != 0 || len(entries) != 0 {
+			return errors.New("report directory must be new or empty and private")
+		}
+	}
+	return nil
+}
+
+func collectWorkstationObservations(ctx context.Context, o workstationOptions, r *workstationReport) {
+	var err error
+	r.Complete = true
+	warn := func(reason string) { workstationWarning(r, reason) }
+	devices := map[uint64]bool{}
+	observeFS := func(path string, device uint64) {
+		if devices[device] {
+			return
+		}
+		devices[device] = true
+		fs := observeWorkstationFilesystem(path, device, o.MinFreeBytes, warn)
+		r.Filesystems = append(r.Filesystems, fs)
+	}
+	observeFS(o.Root, r.RootDevice)
+	paths := workstationCachePaths(o.Root)
+	discoverWorkstationProjects(ctx, r, paths, observeFS, warn)
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+	for _, path := range ordered {
+		r.Categories = append(r.Categories, observeWorkstationCategory(ctx, path, paths[path], r.Policy, observeFS, warn))
+	}
+	sort.SliceStable(r.Categories, func(i, j int) bool {
+		a, b := r.Categories[i], r.Categories[j]
+		if a.AllocatedBytes == nil {
+			return false
+		}
+		if b.AllocatedBytes == nil {
+			return true
+		}
+		return *a.AllocatedBytes > *b.AllocatedBytes
+	})
+	if o.Runtime != nil {
+		r.Runtime, err = o.Runtime.observe(ctx)
+		if err != nil {
+			warn(err.Error())
+		}
+	}
+}
+
+func configureWorkstationOptions(o *workstationOptions, profile string, protected []string, previous, engine, dockerContext string) error {
+	var err error
+	if profile == "" {
+		profile = "workstation"
+	}
+	o.Policy = storagePolicy{Profile: profile, Protected: protected}
+	if previous != "" {
+		o.Previous, err = readWorkstationPrevious(previous)
+		if err != nil {
+			return err
+		}
+	}
+	if engine != "" && engine != "docker" && engine != "podman" {
+		return errors.New("engine must be docker or podman")
+	}
+	if dockerContext != "" && engine != "docker" {
+		return errors.New("docker-context requires engine=docker")
+	}
+	return nil
+}
+
+func configureWorkstationRuntime(ctx context.Context, engine, dockerContext string) *workstationRuntimeSource {
+	var source *workstationRuntimeSource
+	var err error
+	if engine != "" {
+		source = &workstationRuntimeSource{Engine: engine}
+		if engine == "docker" {
+			source.Docker, err = resolveDockerStore(ctx, dockerContext)
+			// Preserve current filesystem observations when the optional daemon is unavailable.
+			if err != nil {
+				source.Docker = nil
+			}
+		}
+	}
+	return source
+}
+
+func workstationWarning(r *workstationReport, reason string) {
+	r.Complete = false
+	if len(r.Warnings) < 1000 {
+		r.Warnings = append(r.Warnings, reason)
+	}
+}
+
+func validateWorkstationCategoryOutput(out string, categories []workstationCategory) error {
+	for _, c := range categories {
+		if cacheWithin(c.Path, out) || cacheWithin(out, c.Path) {
+			return errors.New("report directory overlaps an inventory category")
+		}
+	}
+	return nil
+}
+
+func addWorkstationEnvironmentBase(root, base string, paths map[string]string) {
+	candidates := []string{base, filepath.Join(base, "_cacache"), filepath.Join(base, "pkg/mod")}
+	for _, layout := range cacheLayouts {
+		candidates = append(candidates, filepath.Join(base, filepath.Base(layout.suffix)))
+	}
+	candidates = append(candidates, filepath.Join(base, "registry/cache"), filepath.Join(base, "caches"), filepath.Join(base, "pnpm/store"), filepath.Join(base, "NuGet/v3-cache"))
+	for _, path := range candidates {
+		if cacheWithin(root, path) {
+			if kind := cacheKind(path, false); kind != "" {
+				paths[path] = kind
+			}
+		}
+	}
 }

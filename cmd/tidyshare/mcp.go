@@ -105,46 +105,11 @@ func newMCPOperations(o mcpOptions) (*mcpOperations, error) {
 	if o.root == "" || o.out == "" {
 		return nil, errors.New("mcp requires -root and -out")
 	}
-	var err error
-	o.root, err = filepath.Abs(o.root)
+	rootInfo, outInfo, err := prepareMCPPaths(&o)
 	if err != nil {
 		return nil, err
 	}
-	o.out, err = filepath.Abs(o.out)
-	if err != nil {
-		return nil, err
-	}
-	if protectedWithin(o.root, o.out) || protectedWithin(o.out, o.root) {
-		return nil, errors.New("mcp data root and report directory must not overlap")
-	}
-	rootInfo, err := plainPath(o.root, false)
-	if err != nil || !rootInfo.IsDir() {
-		return nil, errors.New("mcp root must be an existing directory without symlink components")
-	}
-	if _, err := plainPath(o.out, true); err != nil {
-		return nil, errors.New("mcp report path has unsafe components")
-	}
-	if err := os.MkdirAll(o.out, 0o700); err != nil {
-		return nil, fmt.Errorf("create mcp report directory: %w", err)
-	}
-	outInfo, err := plainPath(o.out, false)
-	if err != nil || !outInfo.IsDir() {
-		return nil, errors.New("mcp report path must be a directory")
-	}
-	if o.imageOwner == "" {
-		o.imageOwner = "root"
-	}
-	if o.imageSocket == "" {
-		owner, err := user.Lookup(o.imageOwner)
-		if err != nil {
-			return nil, errors.New("mcp image owner is unknown")
-		}
-		o.imageSocket = "unix:///run/podman/podman.sock"
-		if owner.Uid != "0" {
-			o.imageSocket = "unix://" + filepath.Join("/run/user", owner.Uid, "podman/podman.sock")
-		}
-	}
-	if _, err := socketPath(o.imageSocket); err != nil {
+	if err := configureMCPImageSocket(&o); err != nil {
 		return nil, err
 	}
 	executable, err := os.Executable()
@@ -418,14 +383,7 @@ func (o *mcpOperations) runIn(ctx context.Context, directory, command string, ex
 	if err := o.anchors(); err != nil {
 		return mcpOperationResult{}, err
 	}
-	if command == "scan" || command == "discover" || command == "cleanup" {
-		args = append(args, "-profile", o.options.policy.Profile)
-		for _, root := range o.options.policy.Protected {
-			args = append(args, "-protect", root)
-		}
-	}
-	args = append([]string{command}, args...)
-	args = append(args, "-out", directory, "-formats", formats)
+	args = o.commandArguments(directory, command, formats, args)
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
 	defer cancel()
 	child := exec.CommandContext(ctx, o.executable, args...)
@@ -444,21 +402,8 @@ func (o *mcpOperations) runIn(ctx context.Context, directory, command string, ex
 	if command == "cleanup" && !execute {
 		result.Summary = "cleanup dry run completed; no data removed"
 	}
-	entries, listErr := os.ReadDir(directory)
-	var retainedStages []string
-	if listErr == nil {
-		for _, entry := range entries {
-			if entry.IsDir() && strings.HasPrefix(entry.Name(), "tidyshare-reports-") {
-				path := filepath.Join(directory, entry.Name())
-				if info, err := plainPath(path, false); err == nil && info.IsDir() && info.Mode().Perm()&0o077 == 0 {
-					retainedStages = append(retainedStages, path)
-				}
-			}
-			if entry.Type().IsRegular() && entry.Name() != "reviewed-plan" {
-				result.Reports = append(result.Reports, filepath.Join(directory, entry.Name()))
-			}
-		}
-	}
+	reports, retainedStages, listErr := listMCPReports(directory)
+	result.Reports = reports
 	diagnostic := "inspect private reports locally"
 	if len(retainedStages) > 0 {
 		diagnostic = "private partial reports retained at " + strings.Join(retainedStages, ", ")
@@ -536,4 +481,93 @@ func (o *mcpOperations) inventoryImages(ctx context.Context, in mcpPlanInput) (m
 		result.Reports = append(result.Reports, filepath.Join(dir, entry.Name()))
 	}
 	return result, nil
+}
+
+func configureMCPImageSocket(o *mcpOptions) error {
+	if o.imageOwner == "" {
+		o.imageOwner = "root"
+	}
+	if o.imageSocket == "" {
+		owner, err := user.Lookup(o.imageOwner)
+		if err != nil {
+			return errors.New("mcp image owner is unknown")
+		}
+		o.imageSocket = "unix:///run/podman/podman.sock"
+		if owner.Uid != "0" {
+			o.imageSocket = "unix://" + filepath.Join("/run/user", owner.Uid, "podman/podman.sock")
+		}
+	}
+	if _, err := socketPath(o.imageSocket); err != nil {
+		return err
+	}
+	return nil
+}
+
+func listMCPReports(directory string) ([]string, []string, error) {
+	entries, listErr := os.ReadDir(directory)
+	var retainedStages []string
+	reports := []string{}
+	if listErr == nil {
+		for _, entry := range entries {
+			if path := retainedMCPStage(directory, entry); path != "" {
+				retainedStages = append(retainedStages, path)
+			}
+			if entry.Type().IsRegular() && entry.Name() != "reviewed-plan" {
+				reports = append(reports, filepath.Join(directory, entry.Name()))
+			}
+		}
+	}
+	return reports, retainedStages, listErr
+}
+
+func prepareMCPPaths(o *mcpOptions) (os.FileInfo, os.FileInfo, error) {
+	var err error
+	o.root, err = filepath.Abs(o.root)
+	if err != nil {
+		return nil, nil, err
+	}
+	o.out, err = filepath.Abs(o.out)
+	if err != nil {
+		return nil, nil, err
+	}
+	if protectedWithin(o.root, o.out) || protectedWithin(o.out, o.root) {
+		return nil, nil, errors.New("mcp data root and report directory must not overlap")
+	}
+	rootInfo, err := plainPath(o.root, false)
+	if err != nil || !rootInfo.IsDir() {
+		return nil, nil, errors.New("mcp root must be an existing directory without symlink components")
+	}
+	if _, err := plainPath(o.out, true); err != nil {
+		return nil, nil, errors.New("mcp report path has unsafe components")
+	}
+	if err := os.MkdirAll(o.out, 0o700); err != nil {
+		return nil, nil, fmt.Errorf("create mcp report directory: %w", err)
+	}
+	outInfo, err := plainPath(o.out, false)
+	if err != nil || !outInfo.IsDir() {
+		return nil, nil, errors.New("mcp report path must be a directory")
+	}
+	return rootInfo, outInfo, nil
+}
+
+func (o *mcpOperations) commandArguments(directory, command, formats string, args []string) []string {
+	if command == "scan" || command == "discover" || command == "cleanup" {
+		args = append(args, "-profile", o.options.policy.Profile)
+		for _, root := range o.options.policy.Protected {
+			args = append(args, "-protect", root)
+		}
+	}
+	args = append([]string{command}, args...)
+	args = append(args, "-out", directory, "-formats", formats)
+	return args
+}
+
+func retainedMCPStage(directory string, entry os.DirEntry) string {
+	if entry.IsDir() && strings.HasPrefix(entry.Name(), "tidyshare-reports-") {
+		path := filepath.Join(directory, entry.Name())
+		if info, err := plainPath(path, false); err == nil && info.IsDir() && info.Mode().Perm()&0o077 == 0 {
+			return path
+		}
+	}
+	return ""
 }

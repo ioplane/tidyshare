@@ -57,7 +57,7 @@ func TestWorkstationRefusesReportsInsideCustomOrChromeCache(t *testing.T) {
 		cache := filepath.Join(root, suffix)
 		write(t, filepath.Join(cache, "00", "fixture"), "payload", time.Hour)
 		t.Setenv("GOCACHE", cache)
-		if code := runWorkstation([]string{"-root", root, "-out", filepath.Join(cache, "out")}); code == 0 {
+		if runWorkstation([]string{"-root", root, "-out", filepath.Join(cache, "out")}) == 0 {
 			t.Fatal("report output inside measured cache accepted")
 		}
 		if _, err := os.Lstat(filepath.Join(cache, "out")); !os.IsNotExist(err) {

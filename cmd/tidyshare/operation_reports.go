@@ -233,36 +233,9 @@ type scanRecord struct {
 
 // publishScanReports keeps legacy renderers isolated from user-selected paths.
 func publishScanReports(stage, out string, formats []string, root string) (resultErr error) {
-	selected := map[string]bool{}
-	for _, format := range formats {
-		selected[format] = true
-	}
-	entries, err := os.ReadDir(stage)
+	names, sources, recordCount, err := selectScanReports(stage, formats)
 	if err != nil {
 		return err
-	}
-	var names []string
-	var sources []string
-	recordCount := 0
-	for _, file := range entries {
-		name := file.Name()
-		ext := strings.TrimPrefix(filepath.Ext(name), ".")
-		if name == "coverage.json" || selected[ext] || (ext != "md" && ext != "json" && ext != "jsonl") {
-			names = append(names, name)
-		}
-		if (selected["json"] || selected["jsonl"]) && (ext == "tsv" || name == "catalog.jsonl") {
-			count, err := countScanRecords(filepath.Join(stage, name))
-			if err != nil {
-				return err
-			}
-			recordCount += count
-			sources = append(sources, name)
-		}
-	}
-	for _, format := range []string{"json", "jsonl"} {
-		if selected[format] {
-			names = append(names, "report."+format)
-		}
 	}
 	files, _, err := reserveReports(out, names)
 	if err != nil {
@@ -273,20 +246,8 @@ func publishScanReports(stage, out string, formats []string, root string) (resul
 			resultErr = errors.Join(resultErr, file.Close())
 		}
 	}()
-	for _, name := range names {
-		f := files[name]
-		if name == "report.json" || name == "report.jsonl" {
-			continue
-		}
-		src, err := os.Open(filepath.Join(stage, name))
-		if err != nil {
-			return err
-		}
-		_, err = io.Copy(f, src)
-		err = errors.Join(err, src.Close())
-		if err != nil {
-			return fmt.Errorf("publish scan report: %w", err)
-		}
+	if err := copyScanReports(stage, names, files); err != nil {
+		return err
 	}
 	if err := writeScanMachineReports(stage, root, sources, recordCount, files); err != nil {
 		return fmt.Errorf("publish scan report: %w", err)
@@ -423,4 +384,66 @@ func forEachScanRecord(path, kind string, consume func(scanRecord) error) error 
 		}
 	}
 	return sc.Err()
+}
+
+func copyScanReports(stage string, names []string, files map[string]*os.File) error {
+	for _, name := range names {
+		f := files[name]
+		if name == "report.json" || name == "report.jsonl" {
+			continue
+		}
+		src, err := os.Open(filepath.Join(stage, name))
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(f, src)
+		err = errors.Join(err, src.Close())
+		if err != nil {
+			return fmt.Errorf("publish scan report: %w", err)
+		}
+	}
+	return nil
+}
+
+func selectScanReports(stage string, formats []string) ([]string, []string, int, error) {
+	selected := map[string]bool{}
+	for _, format := range formats {
+		selected[format] = true
+	}
+	entries, err := os.ReadDir(stage)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	var names []string
+	var sources []string
+	recordCount := 0
+	for _, file := range entries {
+		name := file.Name()
+		ext := strings.TrimPrefix(filepath.Ext(name), ".")
+		if scanReportSelected(name, ext, selected) {
+			names = append(names, name)
+		}
+		if scanReportSource(name, ext, selected) {
+			count, err := countScanRecords(filepath.Join(stage, name))
+			if err != nil {
+				return nil, nil, 0, err
+			}
+			recordCount += count
+			sources = append(sources, name)
+		}
+	}
+	for _, format := range []string{"json", "jsonl"} {
+		if selected[format] {
+			names = append(names, "report."+format)
+		}
+	}
+	return names, sources, recordCount, nil
+}
+
+func scanReportSelected(name, ext string, selected map[string]bool) bool {
+	return name == "coverage.json" || selected[ext] || (ext != "md" && ext != "json" && ext != "jsonl")
+}
+
+func scanReportSource(name, ext string, selected map[string]bool) bool {
+	return (selected["json"] || selected["jsonl"]) && (ext == "tsv" || name == "catalog.jsonl")
 }

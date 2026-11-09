@@ -35,7 +35,7 @@ func TestDarwinDedupeRefusesBeforeManifestWrites(t *testing.T) {
 		t.Skip("Darwin capability refusal")
 	}
 	_, dup, plan, q := applyFixture(t)
-	if code := runApply([]string{"-plan", plan, "-quarantine", q, "-mode", "dedupe", "-yes"}); code == 0 {
+	if runApply([]string{"-plan", plan, "-quarantine", q, "-mode", "dedupe", "-yes"}) == 0 {
 		t.Fatal("unsupported dedupe reported success")
 	}
 	if _, err := os.Stat(filepath.Join(q, "MANIFEST.tsv")); !os.IsNotExist(err) {

@@ -288,25 +288,7 @@ func writeImages(r imageReport, o opts) (resultErr error) {
 		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\t%s\n", a.Format, a.Status, a.Size,
 			strings.Join(shorts(a.IDs), ","), strings.Join(a.Tags, ","), strings.Join(a.Stores, ","), strconv.Quote(a.Path))
 	}
-	archived := map[string]bool{}
-	for _, a := range r.Archives {
-		for _, id := range a.IDs {
-			archived[id] = true
-		}
-	}
-	for _, l := range r.Local {
-		st := "local-only"
-		if archived[l.ID] {
-			st = "archived"
-		}
-		kind := "local"
-		if l.Dangling {
-			kind = "local-dangling"
-		} else if len(l.Tags) == 0 {
-			kind = "local-untagged"
-		}
-		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\t\n", kind, st, l.Size, short(l.ID), strings.Join(l.Tags, ","), l.Owner)
-	}
+	writeLocalImages(w, r)
 	if err := finishReport(w, f); err != nil {
 		return err
 	}
@@ -317,23 +299,7 @@ func writeImages(r imageReport, o opts) (resultErr error) {
 	}
 	mw := bufio.NewWriter(md)
 	defer func() { resultErr = errors.Join(resultErr, finishReport(mw, md)) }()
-	var dang, unused int64
-	var nd, nu, untagged int
-	for _, l := range r.Local {
-		if len(l.Tags) == 0 {
-			untagged++
-		}
-		switch {
-		case l.Dangling:
-			dang += l.Size
-			nd++
-		case l.Containers == 0 && len(l.Tags) > 0:
-			unused += l.Size
-			nu++
-		}
-	}
-	fmt.Fprintf(mw, "# Container images\n\n- local images: %d, dangling: %d (%s), tagged without containers: %d (%s; sizes include shared layers), untagged: %d\n- image archives on the share: %d\n\n",
-		len(r.Local), nd, gib(dang), nu, gib(unused), untagged, len(r.Archives))
+	writeImageSummary(mw, r)
 	for _, owner := range owners {
 		fmt.Fprintf(mw, "- store %q unavailable: %s\n", owner, r.Unavailable[owner])
 	}
@@ -360,4 +326,46 @@ func shorts(ids []string) []string {
 		out[i] = short(id)
 	}
 	return out
+}
+
+func writeLocalImages(w io.Writer, r imageReport) {
+	archived := map[string]bool{}
+	for _, a := range r.Archives {
+		for _, id := range a.IDs {
+			archived[id] = true
+		}
+	}
+	for _, l := range r.Local {
+		st := "local-only"
+		if archived[l.ID] {
+			st = "archived"
+		}
+		kind := "local"
+		if l.Dangling {
+			kind = "local-dangling"
+		} else if len(l.Tags) == 0 {
+			kind = "local-untagged"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\t\n", kind, st, l.Size, short(l.ID), strings.Join(l.Tags, ","), l.Owner)
+	}
+}
+
+func writeImageSummary(mw io.Writer, r imageReport) {
+	var dang, unused int64
+	var nd, nu, untagged int
+	for _, l := range r.Local {
+		if len(l.Tags) == 0 {
+			untagged++
+		}
+		switch {
+		case l.Dangling:
+			dang += l.Size
+			nd++
+		case l.Containers == 0 && len(l.Tags) > 0:
+			unused += l.Size
+			nu++
+		}
+	}
+	fmt.Fprintf(mw, "# Container images\n\n- local images: %d, dangling: %d (%s), tagged without containers: %d (%s; sizes include shared layers), untagged: %d\n- image archives on the share: %d\n\n",
+		len(r.Local), nd, gib(dang), nu, gib(unused), untagged, len(r.Archives))
 }

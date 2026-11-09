@@ -54,12 +54,12 @@ func TestMacCacheLayouts(t *testing.T) {
 
 func TestPrivateTemporaryDirectoryResolvesSystemAlias(t *testing.T) {
 	root := t.TempDir()
-	real := filepath.Join(root, "real")
+	realDir := filepath.Join(root, "real")
 	alias := filepath.Join(root, "alias")
-	if err := os.Mkdir(real, 0o700); err != nil {
+	if err := os.Mkdir(realDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Symlink(real, alias); err != nil {
+	if err := os.Symlink(realDir, alias); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("TMPDIR", alias)
@@ -68,7 +68,7 @@ func TestPrivateTemporaryDirectoryResolvesSystemAlias(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(path)
-	if filepath.Dir(path) != real {
+	if filepath.Dir(path) != realDir {
 		t.Fatalf("temporary path retains alias: %s", path)
 	}
 }
@@ -104,7 +104,7 @@ func TestProtectedFileIsNotCatalogued(t *testing.T) {
 	protected := filepath.Join(root, "protected.bin")
 	write(t, protected, "secret fixture", time.Hour)
 	out := filepath.Join(t.TempDir(), "out")
-	if code := runScan([]string{"-root", root, "-out", out, "-images=false", "-protect", protected}); code != 0 {
+	if runScan([]string{"-root", root, "-out", out, "-images=false", "-protect", protected}) != 0 {
 		t.Fatal("scan failed")
 	}
 	body, err := os.ReadFile(filepath.Join(out, "catalog.jsonl"))

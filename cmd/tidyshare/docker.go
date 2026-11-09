@@ -142,28 +142,9 @@ func (s *dockerStore) inventory(ctx context.Context) ([]localImage, string, erro
 	if err != nil {
 		return nil, "", errors.New("docker container references unavailable")
 	}
-	counts := map[string]int{}
-	for _, x := range refs.Items {
-		id := strings.TrimPrefix(x.ImageID, "sha256:")
-		if !exactImageID(id) {
-			return nil, "", errors.New("docker container reference has no exact image identity")
-		}
-		counts[id]++
-	}
-	var images []localImage
-	for _, x := range raw.Items {
-		id := strings.TrimPrefix(x.ID, "sha256:")
-		if !exactImageID(id) || x.Size < 0 {
-			return nil, "", errors.New("docker returned an invalid image identity or size")
-		}
-		var tags []string
-		for _, tag := range x.RepoTags {
-			if tag != "" && tag != "<none>:<none>" {
-				tags = append(tags, tag)
-			}
-		}
-		unknown := x.Descriptor != nil && (strings.Contains(x.Descriptor.MediaType, "index") || strings.Contains(x.Descriptor.MediaType, "manifest.list"))
-		images = append(images, localImage{ID: id, Owner: "docker:" + s.Context, Tags: tags, Size: x.Size, Created: x.Created, Dangling: len(tags) == 0, Containers: counts[id], IdentityUnknown: unknown})
+	images, err := dockerInventoryImages(raw, refs, s.Context)
+	if err != nil {
+		return nil, "", err
 	}
 	summary := fmt.Sprintf("context: %s\nendpoint: %s\ndaemon: %s\nimages: %d\ncontainers: %d\n", s.Context, s.Endpoint, info.Info.ID, len(images), len(refs.Items))
 	df, err := c.DiskUsage(ctx, client.DiskUsageOptions{Images: true, Containers: true, Volumes: true, BuildCache: true})
@@ -265,4 +246,31 @@ func writeImageReports(r imageReport, out string, formats []string) error {
 		}
 	}
 	return nil
+}
+
+func dockerInventoryImages(raw client.ImageListResult, refs client.ContainerListResult, name string) ([]localImage, error) {
+	counts := map[string]int{}
+	for _, x := range refs.Items {
+		id := strings.TrimPrefix(x.ImageID, "sha256:")
+		if !exactImageID(id) {
+			return nil, errors.New("docker container reference has no exact image identity")
+		}
+		counts[id]++
+	}
+	var images []localImage
+	for _, x := range raw.Items {
+		id := strings.TrimPrefix(x.ID, "sha256:")
+		if !exactImageID(id) || x.Size < 0 {
+			return nil, errors.New("docker returned an invalid image identity or size")
+		}
+		var tags []string
+		for _, tag := range x.RepoTags {
+			if tag != "" && tag != "<none>:<none>" {
+				tags = append(tags, tag)
+			}
+		}
+		unknown := x.Descriptor != nil && (strings.Contains(x.Descriptor.MediaType, "index") || strings.Contains(x.Descriptor.MediaType, "manifest.list"))
+		images = append(images, localImage{ID: id, Owner: "docker:" + name, Tags: tags, Size: x.Size, Created: x.Created, Dangling: len(tags) == 0, Containers: counts[id], IdentityUnknown: unknown})
+	}
+	return images, nil
 }

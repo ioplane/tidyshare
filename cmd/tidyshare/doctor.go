@@ -67,27 +67,7 @@ func inspectCapabilities(ctx context.Context, root, engine, dockerContext string
 			r.Managers[manager] = capability{"supported", "execution also requires a validated plan and complete guards"}
 		}
 	}
-	switch engine {
-	case "docker":
-		store, err := resolveDockerStore(ctx, dockerContext)
-		if err == nil {
-			_, _, err = store.inventory(ctx)
-		}
-		if err != nil {
-			r.Runtime = capability{"unavailable", err.Error()}
-		} else {
-			r.Runtime = capability{"supported", "local Docker inventory only; cleanup is unsupported"}
-		}
-	case "podman":
-		_, _, err := listLocal("", "root")
-		if err != nil {
-			r.Runtime = capability{"unavailable", err.Error()}
-		} else {
-			r.Runtime = capability{"supported", "Podman inventory available"}
-		}
-	default:
-		r.Runtime = capability{"unsupported", "engine must be podman or docker"}
-	}
+	r.Runtime = inspectRuntimeCapability(ctx, engine, dockerContext)
 	return r
 }
 
@@ -117,4 +97,28 @@ func runDoctor(args []string) int {
 		fmt.Printf("platform: %s/%s\nfilesystem: %s (%s)\ncache guard: %s (%s)\ndedupe: %s (%s)\nruntime: %s (%s)\n", r.Platform, r.Architecture, r.Filesystem.Status, r.Filesystem.Reason, r.CacheGuard.Status, r.CacheGuard.Reason, r.Dedupe.Status, r.Dedupe.Reason, r.Runtime.Status, r.Runtime.Reason)
 	}
 	return 0
+}
+
+func inspectRuntimeCapability(ctx context.Context, engine, dockerContext string) capability {
+	switch engine {
+	case "docker":
+		store, err := resolveDockerStore(ctx, dockerContext)
+		if err == nil {
+			_, _, err = store.inventory(ctx)
+		}
+		if err != nil {
+			return capability{"unavailable", err.Error()}
+		} else {
+			return capability{"supported", "local Docker inventory only; cleanup is unsupported"}
+		}
+	case "podman":
+		_, _, err := listLocal("", "root")
+		if err != nil {
+			return capability{"unavailable", err.Error()}
+		} else {
+			return capability{"supported", "Podman inventory available"}
+		}
+	default:
+		return capability{"unsupported", "engine must be podman or docker"}
+	}
 }
