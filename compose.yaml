@@ -21,13 +21,15 @@ x-verification-service: &verification-service
 services:
   format:
     <<: *verification-service
+    # Formatting rewrites bind-mounted source files.
+    user: "0:0"
     volumes:
       - .:/workspace:rw
     command: ["gofumpt", "-w", "."]
 
   fmtcheck:
     <<: *verification-service
-    command: ["sh", "-c", "test -z \"$(gofumpt -l .)\""]
+    command: ["sh", "-c", "gofumpt -l . > /tmp/tidyshare-unformatted && test ! -s /tmp/tidyshare-unformatted"]
 
   modcheck:
     <<: *verification-service

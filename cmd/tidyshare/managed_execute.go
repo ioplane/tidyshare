@@ -344,7 +344,8 @@ func executeManagedPlanWithNative(ctx context.Context, p managedPlan, digest str
 			return r, err
 		}
 	}
-	if err := executeManagedTargets(ctx, p.Targets, selected, o, native, &r, persist, record); err != nil {
+	state := managedExecutionState{report: &r, persist: persist, record: record}
+	if err := executeManagedTargets(ctx, p.Targets, selected, o, native, &state); err != nil {
 		return r, err
 	}
 	return r, nil
@@ -374,24 +375,30 @@ func managedExecutionDevices(devices map[uint64]string, p managedPlan, selected 
 	}
 }
 
-func executeManagedTargets(ctx context.Context, targets []managedTarget, selected map[string]bool, o managedExecuteOptions, native managedNativeOps, r *managedExecutionReport, persist, record func(managedResult) error) error {
-	actions := 0
-	failed := false
+type managedExecutionState struct {
+	report  *managedExecutionReport
+	actions int
+	failed  bool
+	persist func(managedResult) error
+	record  func(managedResult) error
+}
+
+func executeManagedTargets(ctx context.Context, targets []managedTarget, selected map[string]bool, o managedExecuteOptions, native managedNativeOps, state *managedExecutionState) error {
 	for _, target := range targets {
 		if len(selected) != 0 && !selected[target.Path] {
 			continue
 		}
-		if o.Limit > 0 && actions >= o.Limit {
+		if o.Limit > 0 && state.actions >= o.Limit {
 			break
 		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := executeManagedTarget(ctx, target, o, native, r, &actions, &failed, persist, record); err != nil {
+		if err := executeManagedTarget(ctx, target, o, native, state); err != nil {
 			return err
 		}
 	}
-	if failed {
+	if state.failed {
 		return errors.New("selected managed operations were blocked or partial; inspect the report")
 	}
 	return nil
@@ -435,40 +442,40 @@ func managedSelectionExists(selected map[string]bool, targets []managedTarget) e
 	return nil
 }
 
-func executeManagedTarget(ctx context.Context, target managedTarget, o managedExecuteOptions, native managedNativeOps, r *managedExecutionReport, actions *int, failed *bool, persist, record func(managedResult) error) error {
+func executeManagedTarget(ctx context.Context, target managedTarget, o managedExecuteOptions, native managedNativeOps, state *managedExecutionState) error {
 	if target.State != "planned" {
-		if err := record(managedResult{Target: target.Path, Status: target.State, Reason: target.Reason}); err != nil {
+		if err := state.record(managedResult{Target: target.Path, Status: target.State, Reason: target.Reason}); err != nil {
 			return err
 		}
-		*failed = *failed || target.State == "blocked"
+		state.failed = state.failed || target.State == "blocked"
 		return nil
 	}
 	dir, err := managedOpenTarget(target)
 	if err != nil {
-		if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
+		if e := state.record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
 			return e
 		}
-		*failed = true
+		state.failed = true
 		return nil
 	}
 	if !o.Execute {
-		return managedDryRunTarget(dir, target, record)
+		return managedDryRunTarget(dir, target, state.record)
 	}
 	if err := native.busy(ctx, target); err != nil {
 		_ = dir.Close()
 		if managedUncertain(err) {
-			return errors.Join(err, record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}))
+			return errors.Join(err, state.record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}))
 		}
-		if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
+		if e := state.record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
 			return e
 		}
-		*failed = true
+		state.failed = true
 		return nil
 	}
 	if target.Kind == "go_build" || target.Kind == "npm" {
-		return executeManagedNative(ctx, target, dir, native, r, actions, failed, persist, record)
+		return executeManagedNative(ctx, target, dir, native, state)
 	}
-	return executeManagedManifest(ctx, target, dir, o, r, actions, failed, persist, record)
+	return executeManagedManifest(ctx, target, dir, o, state)
 }
 
 func managedDryRunTarget(dir *os.File, target managedTarget, record func(managedResult) error) error {
@@ -480,11 +487,11 @@ func managedDryRunTarget(dir *os.File, target managedTarget, record func(managed
 	return nil
 }
 
-func executeManagedNative(ctx context.Context, target managedTarget, dir *os.File, native managedNativeOps, r *managedExecutionReport, actions *int, failed *bool, persist, record func(managedResult) error) error {
+func executeManagedNative(ctx context.Context, target managedTarget, dir *os.File, native managedNativeOps, state *managedExecutionState) error {
 	if err := verifyManagedTool(target.Kind, target.Tool); err != nil {
 		_ = dir.Close()
-		*failed = true
-		if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
+		state.failed = true
+		if e := state.record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
 			return e
 		}
 		return nil
@@ -492,15 +499,15 @@ func executeManagedNative(ctx context.Context, target managedTarget, dir *os.Fil
 	qualified, err := native.qualify(ctx, target.Kind)
 	if managedUncertain(err) {
 		_ = dir.Close()
-		return errors.Join(err, record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}))
+		return errors.Join(err, state.record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}))
 	}
 	if err != nil || !reflect.DeepEqual(qualified, target.Tool) {
-		if err := record(managedResult{Target: target.Path, Status: "blocked", Reason: "native qualification or executable identity differs"}); err != nil {
+		if err := state.record(managedResult{Target: target.Path, Status: "blocked", Reason: "native qualification or executable identity differs"}); err != nil {
 			_ = dir.Close()
 			return err
 		}
 		_ = dir.Close()
-		*failed = true
+		state.failed = true
 		return nil
 	}
 	current, err := managedOpenTarget(target)
@@ -511,31 +518,31 @@ func executeManagedNative(ctx context.Context, target managedTarget, dir *os.Fil
 	_ = current.Close()
 	_, before, measureErr := cacheWalk(ctx, dir, target.Identity.Device, cacheGuardEntry(target.Kind, target.Path))
 	if measureErr != nil {
-		if err := record(managedResult{Target: target.Path, Status: "blocked", Reason: measureErr.Error()}); err != nil {
+		if err := state.record(managedResult{Target: target.Path, Status: "blocked", Reason: measureErr.Error()}); err != nil {
 			_ = dir.Close()
 			return err
 		}
 		_ = dir.Close()
-		*failed = true
+		state.failed = true
 		return nil
 	}
-	if err := persist(managedResult{Target: target.Path, Status: "intent", Reason: "native manager operation, not a file whitelist"}); err != nil {
+	if err := state.persist(managedResult{Target: target.Path, Status: "intent", Reason: "native manager operation, not a file whitelist"}); err != nil {
 		_ = dir.Close()
 		return err
 	}
 	result, runErr := native.run(ctx, target, target.Tool)
-	*actions++
+	state.actions++
 	item := managedResult{Target: target.Path, Status: "native_completed", Command: &result, BeforeFiles: &before}
 	if managedUncertain(runErr) {
 		item.Status = "partial"
 		item.Reason = runErr.Error() + "; changes may be partial"
 		_ = dir.Close()
-		return errors.Join(runErr, record(item))
+		return errors.Join(runErr, state.record(item))
 	}
-	return finishManagedNative(ctx, target, dir, r, failed, item, before, runErr, record)
+	return finishManagedNative(ctx, target, dir, state, item, before, runErr)
 }
 
-func finishManagedNative(ctx context.Context, target managedTarget, dir *os.File, r *managedExecutionReport, failed *bool, item managedResult, before int64, runErr error, record func(managedResult) error) error {
+func finishManagedNative(ctx context.Context, target managedTarget, dir *os.File, state *managedExecutionState, item managedResult, before int64, runErr error) error {
 	afterDir, afterErr := openPlainDirectory(target.Path, false)
 	var after int64
 	if afterErr == nil {
@@ -547,15 +554,15 @@ func finishManagedNative(ctx context.Context, target managedTarget, dir *os.File
 	if afterErr == nil {
 		item.AfterFiles = &after
 		if after < before {
-			r.Changed++
+			state.report.Changed++
 		}
 	}
 	if runErr != nil || afterErr != nil {
 		item.Status = "partial"
 		item.Reason = fmt.Sprintf("native error: %v; post-measurement: %v; changes may be partial", runErr, afterErr)
-		*failed = true
+		state.failed = true
 	}
-	if err := record(item); err != nil {
+	if err := state.record(item); err != nil {
 		_ = dir.Close()
 		return err
 	}
@@ -563,21 +570,21 @@ func finishManagedNative(ctx context.Context, target managedTarget, dir *os.File
 	return nil
 }
 
-func executeManagedManifest(ctx context.Context, target managedTarget, dir *os.File, o managedExecuteOptions, r *managedExecutionReport, actions *int, failed *bool, persist, record func(managedResult) error) error {
+func executeManagedManifest(ctx context.Context, target managedTarget, dir *os.File, o managedExecuteOptions, state *managedExecutionState) error {
 	if _, _, err := cacheWalk(ctx, dir, target.Identity.Device, managedProjectGuard); err != nil {
 		_ = dir.Close()
-		*failed = true
-		if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
+		state.failed = true
+		if e := state.record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
 			return e
 		}
 		return nil
 	}
 	for _, entry := range target.Entries {
-		if o.Limit > 0 && *actions >= o.Limit {
+		if o.Limit > 0 && state.actions >= o.Limit {
 			break
 		}
-		*actions++
-		if err := executeManagedEntry(ctx, target, dir, entry, r, failed, persist, record); err != nil {
+		state.actions++
+		if err := executeManagedEntry(ctx, target, dir, entry, state); err != nil {
 			return err
 		}
 	}
@@ -585,7 +592,7 @@ func executeManagedManifest(ctx context.Context, target managedTarget, dir *os.F
 	return nil
 }
 
-func executeManagedEntry(ctx context.Context, target managedTarget, dir *os.File, entry managedEntry, r *managedExecutionReport, failed *bool, persist, record func(managedResult) error) error {
+func executeManagedEntry(ctx context.Context, target managedTarget, dir *os.File, entry managedEntry, state *managedExecutionState) error {
 	if err := ctx.Err(); err != nil {
 		_ = dir.Close()
 		return err
@@ -603,7 +610,7 @@ func executeManagedEntry(ctx context.Context, target managedTarget, dir *os.File
 	}
 	claimName := ".tidyshare-managed-" + hex.EncodeToString(random[:])
 	claimPath := filepath.Join(target.Path, filepath.Dir(entry.Name), claimName, "entry")
-	if err := persist(managedResult{Target: target.Path, Name: entry.Name, Status: "intent", RecoveryPath: claimPath}); err != nil {
+	if err := state.persist(managedResult{Target: target.Path, Name: entry.Name, Status: "intent", RecoveryPath: claimPath}); err != nil {
 		_ = dir.Close()
 		return err
 	}
@@ -611,16 +618,16 @@ func executeManagedEntry(ctx context.Context, target managedTarget, dir *os.File
 	item := managedResult{Target: target.Path, Name: entry.Name, Status: "skipped", RecoveryPath: recovery}
 	if changed {
 		item.Status = "removed"
-		r.Changed++
+		state.report.Changed++
 	}
 	if err != nil {
 		item.Reason = err.Error()
 		if changed || recovery != "" || !errors.Is(err, errManagedEntryChanged) {
 			item.Status = "partial"
-			*failed = true
+			state.failed = true
 		}
 	}
-	if err := record(item); err != nil {
+	if err := state.record(item); err != nil {
 		_ = dir.Close()
 		return err
 	}

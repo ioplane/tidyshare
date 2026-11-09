@@ -33,3 +33,5 @@ RUN go mod download \
     && git config --system --add safe.directory /workspace
 
 WORKDIR /workspace
+
+USER nobody:nogroup

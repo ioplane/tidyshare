@@ -65,6 +65,13 @@ jobs:
       - name: Test
         run: sudo podman compose run --rm test
 
+      - name: Test root-owned inventory boundaries
+        run: >-
+          sudo podman compose run --rm --user 0:0 test
+          go test -count=1
+          -run '^(TestPodmanSDKPreservesInventoryWhenDiskUsageFails|TestIncompleteStoresDoNotProveArchiveAbsent|TestPodmanSDKRejectsUnsafeSocket)$'
+          ./cmd/tidyshare
+
       - name: Test agent bundle packaging
         run: >-
           sudo podman compose run --rm test
