@@ -136,15 +136,11 @@ func runOwnedCommand(ctx context.Context, cmd *exec.Cmd, ops managedProcessOps) 
 		return false, err
 	}
 	if err = cmd.Start(); err != nil {
-		for _, p := range pipes {
-			_ = p.writer.Close()
-		}
+		closeManagedWriters(pipes)
 		_ = finishManagedPipes(pipes, true)
 		return false, err
 	}
-	for _, p := range pipes {
-		_ = p.writer.Close()
-	}
+	closeManagedWriters(pipes)
 	pid := cmd.Process.Pid
 	if ops.killLeader == nil {
 		ops.killLeader = cmd.Process.Kill
@@ -169,6 +165,12 @@ func runOwnedCommand(ctx context.Context, cmd *exec.Cmd, ops managedProcessOps) 
 	waitErr := cmd.Wait()
 	copyErr := finishManagedPipes(pipes, false)
 	return awaitManagedGroup(ctx, ops, pid, stopErr, waitErr, copyErr)
+}
+
+func closeManagedWriters(pipes []managedPipe) {
+	for _, p := range pipes {
+		_ = p.writer.Close()
+	}
 }
 
 func observeOwnedCommand(ctx context.Context, cmd *exec.Cmd, ops managedProcessOps, pipes []managedPipe, pid int) (bool, error) {

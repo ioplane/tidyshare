@@ -455,10 +455,8 @@ func validateManagedTarget(p managedPlan, t managedTarget, previous []managedTar
 	if err := validateManagedScope(t); err != nil {
 		return err
 	}
-	for _, other := range previous {
-		if cacheWithin(other.Path, t.Path) || cacheWithin(t.Path, other.Path) {
-			return errors.New("managed targets overlap")
-		}
+	if err := validateManagedOverlap(t, previous); err != nil {
+		return err
 	}
 	seen := map[string]bool{}
 	for _, e := range t.Entries {
@@ -467,6 +465,15 @@ func validateManagedTarget(p managedPlan, t managedTarget, previous []managedTar
 			return errors.New("invalid managed manifest entry")
 		}
 		seen[e.Name] = true
+	}
+	return nil
+}
+
+func validateManagedOverlap(t managedTarget, previous []managedTarget) error {
+	for _, other := range previous {
+		if cacheWithin(other.Path, t.Path) || cacheWithin(t.Path, other.Path) {
+			return errors.New("managed targets overlap")
+		}
 	}
 	return nil
 }

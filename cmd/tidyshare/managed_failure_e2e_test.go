@@ -76,19 +76,9 @@ func awaitManagedFailureRow(t *testing.T, row string) bool {
 	}
 	until := time.Now().Add(8 * time.Second)
 	for {
-		gone := true
-		for i, value := range values {
-			pid, e := strconv.Atoi(value)
-			if e != nil || pid <= 0 {
-				t.Errorf("invalid fixture PID")
-				return false
-			}
-			if i == 2 {
-				pid = -pid
-			}
-			if !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
-				gone = false
-			}
+		gone, valid := managedFailureProcessesGone(t, values)
+		if !valid {
+			return false
 		}
 		if gone {
 			break
@@ -100,6 +90,25 @@ func awaitManagedFailureRow(t *testing.T, row string) bool {
 		time.Sleep(10 * time.Millisecond)
 	}
 	return true
+}
+
+func managedFailureProcessesGone(t *testing.T, values []string) (bool, bool) {
+	t.Helper()
+	gone := true
+	for i, value := range values {
+		pid, e := strconv.Atoi(value)
+		if e != nil || pid <= 0 {
+			t.Errorf("invalid fixture PID")
+			return false, false
+		}
+		if i == 2 {
+			pid = -pid
+		}
+		if !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+			gone = false
+		}
+	}
+	return gone, true
 }
 
 func checkManagedRetainedRoots(t *testing.T, scratch, diagnostic string, want int) {
@@ -165,18 +174,7 @@ func checkManagedPlanningUncertainty(t *testing.T, binary, transport string) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		data, err := json.Marshal(result.StructuredContent)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var operation mcpOperationResult
-		if err := json.Unmarshal(data, &operation); err != nil {
-			t.Fatal(err)
-		}
-		diagnostic = operation.Summary
-		if !result.IsError || operation.PlanSHA256 != "" || len(operation.Reports) != 0 {
-			t.Fatalf("usable MCP plan exposed: %+v", result)
-		}
+		diagnostic = managedUncertainMCPResult(t, result)
 	}
 	entries, err := os.ReadDir(out)
 	if err != nil && !os.IsNotExist(err) {
@@ -190,6 +188,23 @@ func checkManagedPlanningUncertainty(t *testing.T, binary, transport string) {
 	if strings.Count(string(calls), "\n") != 1 || strings.Contains(string(calls), "node-start") {
 		t.Fatalf("next native target observed: %s", calls)
 	}
+}
+
+func managedUncertainMCPResult(t *testing.T, result *mcp.CallToolResult) string {
+	t.Helper()
+	data, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var operation mcpOperationResult
+	if err := json.Unmarshal(data, &operation); err != nil {
+		t.Fatal(err)
+	}
+	diagnostic := operation.Summary
+	if !result.IsError || operation.PlanSHA256 != "" || len(operation.Reports) != 0 {
+		t.Fatalf("usable MCP plan exposed: %+v", result)
+	}
+	return diagnostic
 }
 
 func TestManagedExecutionUncertaintyCLI(t *testing.T) {

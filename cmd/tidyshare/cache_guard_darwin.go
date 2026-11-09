@@ -87,17 +87,7 @@ func darwinPathWithin(root, path string) bool {
 
 func darwinCheckProcess(ctx context.Context, path string, pid int, ownFDs []uintptr, api darwinProcAPI) error {
 	query := func(kind int, arg uint64) (darwinProcResult, error) {
-		if err := ctx.Err(); err != nil {
-			return darwinProcResult{}, err
-		}
-		out, err := api.query(kind, pid, arg)
-		if err != nil {
-			return out, fmt.Errorf("cannot inspect process %d (query %d): %w", pid, kind, err)
-		}
-		if darwinPathWithin(path, out.path) || (out.root != "" && darwinPathWithin(path, out.root)) {
-			return out, fmt.Errorf("cache is in use by process %d (query %d)", pid, kind)
-		}
-		return out, nil
+		return darwinQueryProcess(ctx, path, pid, api, kind, arg)
 	}
 	before, err := query(darwinIdentity, 0)
 	if err != nil {
@@ -129,6 +119,20 @@ func darwinCheckProcess(ctx context.Context, path string, pid int, ownFDs []uint
 		return fmt.Errorf("cannot resolve all mapped files for process %d", pid)
 	}
 	return nil
+}
+
+func darwinQueryProcess(ctx context.Context, path string, pid int, api darwinProcAPI, kind int, arg uint64) (darwinProcResult, error) {
+	if err := ctx.Err(); err != nil {
+		return darwinProcResult{}, err
+	}
+	out, err := api.query(kind, pid, arg)
+	if err != nil {
+		return out, fmt.Errorf("cannot inspect process %d (query %d): %w", pid, kind, err)
+	}
+	if darwinPathWithin(path, out.path) || (out.root != "" && darwinPathWithin(path, out.root)) {
+		return out, fmt.Errorf("cache is in use by process %d (query %d)", pid, kind)
+	}
+	return out, nil
 }
 
 func darwinCheckDescriptors(ctx context.Context, pid int, ownFDs []uintptr, api darwinProcAPI, query func(int, uint64) (darwinProcResult, error)) error {

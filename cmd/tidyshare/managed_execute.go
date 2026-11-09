@@ -103,7 +103,11 @@ func managedApplicationBusy(ctx context.Context, target managedTarget) error {
 		}
 		return errors.New("application process observation is unavailable")
 	}
-	for _, line := range strings.Split(result.Stdout, "\n") {
+	return managedApplicationProcesses(result.Stdout, target)
+}
+
+func managedApplicationProcesses(output string, target managedTarget) error {
+	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 3 {
 			continue
@@ -410,18 +414,25 @@ func managedExecutionSelection(p managedPlan, digest string, o managedExecuteOpt
 		}
 		selected[path] = true
 	}
+	if err := managedSelectionExists(selected, p.Targets); err != nil {
+		return nil, err
+	}
+	return selected, nil
+}
+
+func managedSelectionExists(selected map[string]bool, targets []managedTarget) error {
 	for path := range selected {
 		found := false
-		for _, target := range p.Targets {
+		for _, target := range targets {
 			if target.Path == path {
 				found = true
 			}
 		}
 		if !found {
-			return nil, errors.New("selected target is absent from the reviewed plan")
+			return errors.New("selected target is absent from the reviewed plan")
 		}
 	}
-	return selected, nil
+	return nil
 }
 
 func executeManagedTarget(ctx context.Context, target managedTarget, o managedExecuteOptions, native managedNativeOps, r *managedExecutionReport, actions *int, failed *bool, persist, record func(managedResult) error) error {
@@ -441,12 +452,7 @@ func executeManagedTarget(ctx context.Context, target managedTarget, o managedEx
 		return nil
 	}
 	if !o.Execute {
-		if err := record(managedResult{Target: target.Path, Status: "would_apply", Reason: "dry run; consumer observation and execution remain required"}); err != nil {
-			_ = dir.Close()
-			return err
-		}
-		_ = dir.Close()
-		return nil
+		return managedDryRunTarget(dir, target, record)
 	}
 	if err := native.busy(ctx, target); err != nil {
 		_ = dir.Close()
@@ -463,6 +469,15 @@ func executeManagedTarget(ctx context.Context, target managedTarget, o managedEx
 		return executeManagedNative(ctx, target, dir, native, r, actions, failed, persist, record)
 	}
 	return executeManagedManifest(ctx, target, dir, o, r, actions, failed, persist, record)
+}
+
+func managedDryRunTarget(dir *os.File, target managedTarget, record func(managedResult) error) error {
+	if err := record(managedResult{Target: target.Path, Status: "would_apply", Reason: "dry run; consumer observation and execution remain required"}); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	_ = dir.Close()
+	return nil
 }
 
 func executeManagedNative(ctx context.Context, target managedTarget, dir *os.File, native managedNativeOps, r *managedExecutionReport, actions *int, failed *bool, persist, record func(managedResult) error) error {
@@ -517,6 +532,10 @@ func executeManagedNative(ctx context.Context, target managedTarget, dir *os.Fil
 		_ = dir.Close()
 		return errors.Join(runErr, record(item))
 	}
+	return finishManagedNative(ctx, target, dir, r, failed, item, before, runErr, record)
+}
+
+func finishManagedNative(ctx context.Context, target managedTarget, dir *os.File, r *managedExecutionReport, failed *bool, item managedResult, before int64, runErr error, record func(managedResult) error) error {
 	afterDir, afterErr := openPlainDirectory(target.Path, false)
 	var after int64
 	if afterErr == nil {
