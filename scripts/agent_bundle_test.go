@@ -8,6 +8,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -251,6 +252,40 @@ func TestBundleArchiveRemainsPrivate(t *testing.T) {
 	}
 }
 
+func readBundleTestManifest(t *testing.T, entries []archiveEntry) map[string]any {
+	t.Helper()
+	var manifest map[string]any
+	for _, entry := range entries {
+		if entry.header.Name == "tidyshare-agent-bundle/VERSION" && string(entry.body) != "v0.1.0\n" {
+			t.Fatal("VERSION differs from embedded version")
+		}
+		if entry.header.Name == "tidyshare-agent-bundle/manifest.json" {
+			if err := json.Unmarshal(entry.body, &manifest); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if entry.header.Typeflag == tar.TypeReg && (entry.header.Mode != 0o644 || entry.header.Uid != 0 || entry.header.Gid != 0 || entry.header.ModTime.Unix() != 0) {
+			t.Fatalf("nondeterministic header: %+v", entry.header)
+		}
+	}
+	return manifest
+}
+
+func assertBundleEntries(t *testing.T, entries []archiveEntry) {
+	t.Helper()
+	if len(entries) != 16 {
+		t.Fatalf("archive entries=%d want root plus15files", len(entries))
+	}
+	manifest := readBundleTestManifest(t, entries)
+	if len(manifest) != 3 || manifest["version"] != "v0.1.0" || manifest["commit"] != fixtureCommit {
+		t.Fatalf("manifest contract: %+v", manifest)
+	}
+	files, ok := manifest["files"].(map[string]any)
+	if !ok || len(files) != 14 || files["VERSION"] == nil || files["manifest.json"] != nil {
+		t.Fatal("manifest payload coverage incorrect")
+	}
+}
+
 func TestBundleDeterministicAndVersionMatched(t *testing.T) {
 	source := bundleSource(t)
 	first, err := buildBundle(source, t.TempDir(), "0.1.0", fixtureCommit)
@@ -277,31 +312,7 @@ func TestBundleDeterministicAndVersionMatched(t *testing.T) {
 			t.Fatal("mismatch accepted")
 		}
 	}
-	entries := readArchive(t, first)
-	if len(entries) != 16 {
-		t.Fatalf("archive entries=%d want root plus15files", len(entries))
-	}
-	var manifest map[string]any
-	for _, entry := range entries {
-		if entry.header.Name == "tidyshare-agent-bundle/VERSION" && string(entry.body) != "v0.1.0\n" {
-			t.Fatal("VERSION differs from embedded version")
-		}
-		if entry.header.Name == "tidyshare-agent-bundle/manifest.json" {
-			if err := json.Unmarshal(entry.body, &manifest); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if entry.header.Typeflag == tar.TypeReg && (entry.header.Mode != 0o644 || entry.header.Uid != 0 || entry.header.Gid != 0 || entry.header.ModTime.Unix() != 0) {
-			t.Fatalf("nondeterministic header: %+v", entry.header)
-		}
-	}
-	if len(manifest) != 3 || manifest["version"] != "v0.1.0" || manifest["commit"] != fixtureCommit {
-		t.Fatalf("manifest contract: %+v", manifest)
-	}
-	files, ok := manifest["files"].(map[string]any)
-	if !ok || len(files) != 14 || files["VERSION"] == nil || files["manifest.json"] != nil {
-		t.Fatal("manifest payload coverage incorrect")
-	}
+	assertBundleEntries(t, readArchive(t, first))
 }
 
 func TestBundleRejectsIncompleteOrUnsafeSource(t *testing.T) {
@@ -355,7 +366,7 @@ func readArchive(t *testing.T, path string) []archiveEntry {
 	var entries []archiveEntry
 	for {
 		header, err := tr.Next()
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
@@ -400,6 +411,37 @@ func tamperedArchive(t *testing.T, entries []archiveEntry) string {
 	return path
 }
 
+func corruptBundleArchive(entries []archiveEntry, kind string) []archiveEntry {
+	switch kind {
+	case "checksum":
+		for i := range entries {
+			if strings.HasSuffix(entries[i].header.Name, "/README.md") {
+				entries[i].body = []byte("corrupt")
+			}
+		}
+	case "missing-workflow":
+		for i := range entries {
+			if strings.HasSuffix(entries[i].header.Name, "/workflows/testing.md") {
+				entries = append(entries[:i], entries[i+1:]...)
+				break
+			}
+		}
+	case "duplicate":
+		entries = append(entries, entries[1])
+	case "traversal":
+		entries[1].header.Name = "tidyshare-agent-bundle/../escape"
+	case "absolute":
+		entries[1].header.Name = "/escape"
+	case "symlink":
+		entries[1].header.Typeflag = tar.TypeSymlink
+		entries[1].header.Linkname = "../escape"
+		entries[1].body = nil
+	case "executable":
+		entries[1].header.Mode = 0o755
+	}
+	return entries
+}
+
 func TestBundleRejectsCorruptOrUnsafeArchives(t *testing.T) {
 	original, err := buildBundle(bundleSource(t), t.TempDir(), "0.1.0", fixtureCommit)
 	if err != nil {
@@ -408,33 +450,7 @@ func TestBundleRejectsCorruptOrUnsafeArchives(t *testing.T) {
 	for _, kind := range []string{"checksum", "missing-workflow", "duplicate", "traversal", "symlink", "absolute", "executable"} {
 		t.Run(kind, func(t *testing.T) {
 			entries := readArchive(t, original)
-			switch kind {
-			case "checksum":
-				for i := range entries {
-					if strings.HasSuffix(entries[i].header.Name, "/README.md") {
-						entries[i].body = []byte("corrupt")
-					}
-				}
-			case "missing-workflow":
-				for i := range entries {
-					if strings.HasSuffix(entries[i].header.Name, "/workflows/testing.md") {
-						entries = append(entries[:i], entries[i+1:]...)
-						break
-					}
-				}
-			case "duplicate":
-				entries = append(entries, entries[1])
-			case "traversal":
-				entries[1].header.Name = "tidyshare-agent-bundle/../escape"
-			case "absolute":
-				entries[1].header.Name = "/escape"
-			case "symlink":
-				entries[1].header.Typeflag = tar.TypeSymlink
-				entries[1].header.Linkname = "../escape"
-				entries[1].body = nil
-			case "executable":
-				entries[1].header.Mode = 0o755
-			}
+			entries = corruptBundleArchive(entries, kind)
 			if err := verifyBundle(tamperedArchive(t, entries), "0.1.0", fixtureCommit); err == nil {
 				t.Fatal("corrupt archive accepted")
 			}

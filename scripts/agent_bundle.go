@@ -29,9 +29,11 @@ import (
 )
 
 const (
-	bundleRoot       = "tidyshare-agent-bundle"
-	bundleFileLimit  = 8 << 20
-	bundleTotalLimit = 64 << 20
+	bundleRoot         = "tidyshare-agent-bundle"
+	bundleManifestName = "manifest.json"
+	vcsRevisionSetting = "vcs.revision"
+	bundleFileLimit    = 8 << 20
+	bundleTotalLimit   = 64 << 20
 )
 
 var payloadFiles = []string{
@@ -91,16 +93,13 @@ func manifestBytes(manifest bundleManifest) ([]byte, error) {
 	return append(data, '\n'), err
 }
 
-func buildBundle(source, out, version, commit string) (string, error) {
-	if err := validateBundleIdentity(version, commit); err != nil {
-		return "", err
-	}
+func readBundlePayload(source string) (map[string][]byte, error) {
 	root, err := os.Lstat(source)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if !root.IsDir() || root.Mode()&os.ModeSymlink != 0 {
-		return "", errors.New("bundle source must be a plain directory")
+		return nil, errors.New("bundle source must be a plain directory")
 	}
 	allowed := map[string]bool{}
 	for _, name := range payloadFiles {
@@ -112,29 +111,8 @@ func buildBundle(source, out, version, commit string) (string, error) {
 		if err != nil {
 			return err
 		}
-		relative, err := filepath.Rel(source, path)
-		if err != nil {
-			return err
-		}
-		name := filepath.ToSlash(relative)
-		if entry.IsDir() {
-			if name != "." && name != "workflows" && name != "examples" {
-				return fmt.Errorf("unexpected bundle directory %q", name)
-			}
-			return nil
-		}
-		if !allowed[name] {
-			return fmt.Errorf("unexpected bundle source file %q", name)
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 != 0 || info.Size() <= 0 || info.Size() > bundleFileLimit {
-			return fmt.Errorf("bundle source must be a bounded regular non-executable file: %s", name)
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
+		name, data, err := readBundleSourceEntry(source, path, entry, allowed)
+		if err != nil || data == nil {
 			return err
 		}
 		total += len(data)
@@ -145,12 +123,49 @@ func buildBundle(source, out, version, commit string) (string, error) {
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	for _, name := range payloadFiles {
 		if payload[name] == nil {
-			return "", fmt.Errorf("missing bundle file %s", name)
+			return nil, fmt.Errorf("missing bundle file %s", name)
 		}
+	}
+	return payload, nil
+}
+
+func readBundleSourceEntry(source, path string, entry fs.DirEntry, allowed map[string]bool) (string, []byte, error) {
+	relative, err := filepath.Rel(source, path)
+	if err != nil {
+		return "", nil, err
+	}
+	name := filepath.ToSlash(relative)
+	if entry.IsDir() {
+		if name != "." && name != "workflows" && name != "examples" {
+			return "", nil, fmt.Errorf("unexpected bundle directory %q", name)
+		}
+		return "", nil, nil
+	}
+	if !allowed[name] {
+		return "", nil, fmt.Errorf("unexpected bundle source file %q", name)
+	}
+	info, err := entry.Info()
+	if err != nil {
+		return "", nil, err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 != 0 || info.Size() <= 0 || info.Size() > bundleFileLimit {
+		return "", nil, fmt.Errorf("bundle source must be a bounded regular non-executable file: %s", name)
+	}
+	data, err := os.ReadFile(path)
+	return name, data, err
+}
+
+func buildBundle(source, out, version, commit string) (string, error) {
+	if err := validateBundleIdentity(version, commit); err != nil {
+		return "", err
+	}
+	payload, err := readBundlePayload(source)
+	if err != nil {
+		return "", err
 	}
 	payload["VERSION"] = []byte("v" + version + "\n")
 	manifest := bundleManifest{Version: "v" + version, Commit: commit, Files: map[string]string{}}
@@ -160,11 +175,11 @@ func buildBundle(source, out, version, commit string) (string, error) {
 		manifest.Files[name] = hex.EncodeToString(sum[:])
 		names = append(names, name)
 	}
-	payload["manifest.json"], err = manifestBytes(manifest)
+	payload[bundleManifestName], err = manifestBytes(manifest)
 	if err != nil {
 		return "", err
 	}
-	names = append(names, "manifest.json")
+	names = append(names, bundleManifestName)
 	slices.Sort(names)
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		return "", err
@@ -198,6 +213,102 @@ func buildBundle(source, out, version, commit string) (string, error) {
 	return destination, nil
 }
 
+func readBundleArchive(gz io.Reader, allowed map[string]bool) (map[string][]byte, error) {
+	tr := tar.NewReader(gz)
+	payload := map[string][]byte{}
+	rootSeen := false
+	previous := ""
+	total := int64(0)
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		name, err := validateBundleHeader(header, previous, rootSeen, allowed)
+		if err != nil {
+			return nil, err
+		}
+		previous = header.Name
+		if name == "" {
+			rootSeen = true
+			continue
+		}
+		total += header.Size
+		if total > bundleTotalLimit {
+			return nil, errors.New("bundle payload exceeds size limit")
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, err
+		}
+		payload[name] = data
+	}
+	if !rootSeen || len(payload) != len(allowed) {
+		return nil, errors.New("bundle is incomplete")
+	}
+	return payload, nil
+}
+
+func validateBundleHeader(header *tar.Header, previous string, rootSeen bool, allowed map[string]bool) (string, error) {
+	if header.Name <= previous {
+		return "", errors.New("duplicate or unsorted archive member")
+	}
+	if header.Format != tar.FormatUSTAR || len(header.PAXRecords) != 0 || header.Uid != 0 || header.Gid != 0 || header.Uname != "" || header.Gname != "" || header.ModTime.Unix() != 0 {
+		return "", errors.New("unexpected tar header")
+	}
+	if header.Name == bundleRoot+"/" {
+		if rootSeen || header.Typeflag != tar.TypeDir || header.Mode != 0o755 || header.Size != 0 {
+			return "", errors.New("invalid archive root")
+		}
+		return "", nil
+	}
+	name, ok := strings.CutPrefix(header.Name, bundleRoot+"/")
+	if !ok || !allowed[name] || header.Typeflag != tar.TypeReg || header.Mode != 0o644 || header.Size <= 0 || header.Size > bundleFileLimit {
+		return "", fmt.Errorf("unsafe or unexpected archive member %q", header.Name)
+	}
+	return name, nil
+}
+
+func verifyBundleManifest(payload map[string][]byte, allowed map[string]bool, version, commit string) error {
+	for name := range allowed {
+		if payload[name] == nil {
+			return fmt.Errorf("missing archive member %s", name)
+		}
+	}
+	var manifest bundleManifest
+	decoder := json.NewDecoder(bytes.NewReader(payload[bundleManifestName]))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&manifest); err != nil {
+		return err
+	}
+	canonical, err := manifestBytes(manifest)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(canonical, payload[bundleManifestName]) {
+		return errors.New("manifest is not canonical")
+	}
+	if manifest.Version != "v"+version || manifest.Commit != commit || string(payload["VERSION"]) != "v"+version+"\n" {
+		return errors.New("bundle version or source commit mismatch")
+	}
+	if len(manifest.Files) != len(allowed)-1 {
+		return errors.New("manifest file list is incomplete")
+	}
+	for name, data := range payload {
+		if name == bundleManifestName {
+			continue
+		}
+		sum := sha256.Sum256(data)
+		if manifest.Files[name] != hex.EncodeToString(sum[:]) {
+			return fmt.Errorf("bundle checksum mismatch: %s", name)
+		}
+	}
+	return nil
+}
+
 func verifyBundle(archive, version, commit string) error {
 	if err := validateBundleIdentity(version, commit); err != nil {
 		return err
@@ -217,50 +328,13 @@ func verifyBundle(archive, version, commit string) error {
 	if !gz.ModTime.IsZero() || gz.Name != "" || gz.Comment != "" || len(gz.Extra) != 0 || gz.OS != 255 {
 		return errors.New("unexpected gzip header")
 	}
-	allowed := map[string]bool{"VERSION": true, "manifest.json": true}
+	allowed := map[string]bool{"VERSION": true, bundleManifestName: true}
 	for _, name := range payloadFiles {
 		allowed[name] = true
 	}
-	tr := tar.NewReader(gz)
-	payload := map[string][]byte{}
-	rootSeen := false
-	previous := ""
-	total := int64(0)
-	for {
-		header, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		if header.Name <= previous {
-			return errors.New("duplicate or unsorted archive member")
-		}
-		previous = header.Name
-		if header.Format != tar.FormatUSTAR || len(header.PAXRecords) != 0 || header.Uid != 0 || header.Gid != 0 || header.Uname != "" || header.Gname != "" || header.ModTime.Unix() != 0 {
-			return errors.New("unexpected tar header")
-		}
-		if header.Name == bundleRoot+"/" {
-			if rootSeen || header.Typeflag != tar.TypeDir || header.Mode != 0o755 || header.Size != 0 {
-				return errors.New("invalid archive root")
-			}
-			rootSeen = true
-			continue
-		}
-		name, ok := strings.CutPrefix(header.Name, bundleRoot+"/")
-		if !ok || !allowed[name] || header.Typeflag != tar.TypeReg || header.Mode != 0o644 || header.Size <= 0 || header.Size > bundleFileLimit {
-			return fmt.Errorf("unsafe or unexpected archive member %q", header.Name)
-		}
-		total += header.Size
-		if total > bundleTotalLimit {
-			return errors.New("bundle payload exceeds size limit")
-		}
-		data, err := io.ReadAll(tr)
-		if err != nil {
-			return err
-		}
-		payload[name] = data
+	payload, err := readBundleArchive(gz, allowed)
+	if err != nil {
+		return err
 	}
 	// Consume the gzip checksum. Reject additional gzip members or hidden tar data.
 	remainder, err := io.ReadAll(io.LimitReader(gz, 1025))
@@ -273,43 +347,7 @@ func verifyBundle(archive, version, commit string) error {
 	if _, err := input.Peek(1); !errors.Is(err, io.EOF) {
 		return errors.New("unexpected data after gzip member")
 	}
-	if !rootSeen || len(payload) != len(allowed) {
-		return errors.New("bundle is incomplete")
-	}
-	for name := range allowed {
-		if payload[name] == nil {
-			return fmt.Errorf("missing archive member %s", name)
-		}
-	}
-	var manifest bundleManifest
-	decoder := json.NewDecoder(bytes.NewReader(payload["manifest.json"]))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&manifest); err != nil {
-		return err
-	}
-	canonical, err := manifestBytes(manifest)
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(canonical, payload["manifest.json"]) {
-		return errors.New("manifest is not canonical")
-	}
-	if manifest.Version != "v"+version || manifest.Commit != commit || string(payload["VERSION"]) != "v"+version+"\n" {
-		return errors.New("bundle version or source commit mismatch")
-	}
-	if len(manifest.Files) != len(allowed)-1 {
-		return errors.New("manifest file list is incomplete")
-	}
-	for name, data := range payload {
-		if name == "manifest.json" {
-			continue
-		}
-		sum := sha256.Sum256(data)
-		if manifest.Files[name] != hex.EncodeToString(sum[:]) {
-			return fmt.Errorf("bundle checksum mismatch: %s", name)
-		}
-	}
-	return nil
+	return verifyBundleManifest(payload, allowed, version, commit)
 }
 
 type binaryReceipt struct {
@@ -392,10 +430,10 @@ func recordBinaryReceipt(binary, destination, version, commit, ldflags string, n
 	if filepath.Base(binary) != name {
 		return errors.New("binary filename does not match its platform metadata")
 	}
-	if revision := settings["vcs.revision"]; revision != "" && revision != commit {
+	if revision := settings[vcsRevisionSetting]; revision != "" && revision != commit {
 		return errors.New("binary VCS commit differs from prepared source")
 	}
-	receipt := binaryReceipt{Name: name, Version: "v" + version, Commit: commit, GoVersion: info.GoVersion, GOOS: settings["GOOS"], GOARCH: settings["GOARCH"], CGOEnabled: settings["CGO_ENABLED"], Compiler: settings["-compiler"], LDFlags: ldflags, VCSRevision: settings["vcs.revision"], VCSModified: settings["vcs.modified"]}
+	receipt := binaryReceipt{Name: name, Version: "v" + version, Commit: commit, GoVersion: info.GoVersion, GOOS: settings["GOOS"], GOARCH: settings["GOARCH"], CGOEnabled: settings["CGO_ENABLED"], Compiler: settings["-compiler"], LDFlags: ldflags, VCSRevision: settings[vcsRevisionSetting], VCSModified: settings["vcs.modified"]}
 	if native {
 		if receipt.GOOS != runtime.GOOS || receipt.GOARCH != runtime.GOARCH {
 			return errors.New("native version smoke requires the matching host platform")
@@ -455,7 +493,7 @@ func readBinaryReceipt(path string) (binaryReceipt, error) {
 		return receipt, err
 	}
 	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
+	if decoder.Decode(&trailing) != io.EOF {
 		return receipt, errors.New("receipt contains trailing data")
 	}
 	return receipt, nil
@@ -493,90 +531,91 @@ func hashReleaseFile(path string) (string, error) {
 }
 
 // Metadata checks do not execute foreign binaries.
-func verifyReleaseAssets(directory, version, commit string) error {
-	if err := validateBundleIdentity(version, commit); err != nil {
-		return err
+type releaseTarget struct{ os, arch, cgo string }
+
+func verifyReleaseBinary(directory, version, commit, goVersion string, target releaseTarget) (string, error) {
+	name := "tidyshare_v" + version + "_" + target.os + "_" + target.arch
+	path := filepath.Join(directory, name)
+	stat, err := os.Lstat(path)
+	if err != nil {
+		return "", err
 	}
-	prefix := "tidyshare_v" + version
-	checksumName := prefix + "_checksums.txt"
-	archiveName := prefix + "_agent-bundle.tar.gz"
-	checksums := map[string]string{}
-	expected := map[string]bool{archiveName: true}
-	goVersion := ""
-	for _, target := range []struct{ os, arch, cgo string }{{"linux", "amd64", "0"}, {"linux", "arm64", "0"}, {"darwin", "amd64", "1"}, {"darwin", "arm64", "1"}} {
-		name := prefix + "_" + target.os + "_" + target.arch
-		expected[name] = true
-		path := filepath.Join(directory, name)
-		stat, err := os.Lstat(path)
-		if err != nil {
-			return err
-		}
-		if !stat.Mode().IsRegular() {
-			return fmt.Errorf("release asset is not a plain file: %s", name)
-		}
-		info, settings, err := readBinarySettings(path)
-		if err != nil {
-			return fmt.Errorf("read %s metadata: %w", name, err)
-		}
-		if info.GoVersion == "" {
-			return fmt.Errorf("missing Go version in %s", name)
-		}
-		if goVersion == "" {
-			goVersion = info.GoVersion
-		} else if goVersion != info.GoVersion {
-			return errors.New("binary Go versions differ")
-		}
-		if settings["GOOS"] != target.os || settings["GOARCH"] != target.arch || settings["CGO_ENABLED"] != target.cgo {
-			return fmt.Errorf("platform metadata mismatch: %s", name)
-		}
-		// -trimpath removes ldflags from buildinfo. Check the digest-bound job receipt.
-		receipt, err := readBinaryReceipt(filepath.Join(directory, "binary-"+target.os+"-"+target.arch+".json"))
-		if err != nil {
-			return err
-		}
-		hash, err := hashReleaseFile(path)
-		if err != nil {
-			return err
-		}
-		if receipt.Name != name || receipt.SHA256 != hash || receipt.Version != "v"+version || receipt.Commit != commit || receipt.LDFlags != releaseLDFlags(version, commit) {
-			return fmt.Errorf("binary receipt identity mismatch: %s", name)
-		}
-		if receipt.GoVersion != info.GoVersion || receipt.GOOS != target.os || receipt.GOARCH != target.arch || receipt.CGOEnabled != target.cgo || receipt.Compiler != settings["-compiler"] || receipt.Compiler != "gc" || receipt.VCSRevision != settings["vcs.revision"] || receipt.VCSModified != settings["vcs.modified"] {
-			return fmt.Errorf("binary receipt metadata mismatch: %s", name)
-		}
-		if receipt.VCSRevision != "" && receipt.VCSRevision != commit {
-			return fmt.Errorf("binary VCS source mismatch: %s", name)
-		}
-		if receipt.NativeVersion != "" && receipt.NativeVersion != releaseVersionOutput(version, commit) {
-			return fmt.Errorf("native smoke receipt mismatch: %s", name)
-		}
+	if !stat.Mode().IsRegular() {
+		return "", fmt.Errorf("release asset is not a plain file: %s", name)
 	}
-	entries, err := os.ReadDir(directory)
+	info, settings, err := readBinarySettings(path)
+	if err != nil {
+		return "", fmt.Errorf("read %s metadata: %w", name, err)
+	}
+	if info.GoVersion == "" {
+		return "", fmt.Errorf("missing Go version in %s", name)
+	}
+	if goVersion != "" && goVersion != info.GoVersion {
+		return "", errors.New("binary Go versions differ")
+	}
+	if settings["GOOS"] != target.os || settings["GOARCH"] != target.arch || settings["CGO_ENABLED"] != target.cgo {
+		return "", fmt.Errorf("platform metadata mismatch: %s", name)
+	}
+	if err := verifyReleaseBinaryReceipt(directory, name, version, commit, target, info.GoVersion, settings); err != nil {
+		return "", err
+	}
+	return info.GoVersion, nil
+}
+
+func verifyReleaseBinaryReceipt(directory, name, version, commit string, target releaseTarget, goVersion string, settings map[string]string) error {
+	// -trimpath removes ldflags from buildinfo. Check the digest-bound job receipt.
+	receipt, err := readBinaryReceipt(filepath.Join(directory, "binary-"+target.os+"-"+target.arch+".json"))
 	if err != nil {
 		return err
 	}
+	hash, err := hashReleaseFile(filepath.Join(directory, name))
+	if err != nil {
+		return err
+	}
+	if receipt.Name != name || receipt.SHA256 != hash || receipt.Version != "v"+version || receipt.Commit != commit || receipt.LDFlags != releaseLDFlags(version, commit) {
+		return fmt.Errorf("binary receipt identity mismatch: %s", name)
+	}
+	if receipt.GoVersion != goVersion || receipt.GOOS != target.os || receipt.GOARCH != target.arch || receipt.CGOEnabled != target.cgo || receipt.Compiler != settings["-compiler"] || receipt.Compiler != "gc" || receipt.VCSRevision != settings[vcsRevisionSetting] || receipt.VCSModified != settings["vcs.modified"] {
+		return fmt.Errorf("binary receipt metadata mismatch: %s", name)
+	}
+	if receipt.VCSRevision != "" && receipt.VCSRevision != commit {
+		return fmt.Errorf("binary VCS source mismatch: %s", name)
+	}
+	if receipt.NativeVersion != "" && receipt.NativeVersion != releaseVersionOutput(version, commit) {
+		return fmt.Errorf("native smoke receipt mismatch: %s", name)
+	}
+	return nil
+}
+
+func releaseAssetHashes(directory, checksumName string, expected map[string]bool) (map[string]string, error) {
+	checksums := map[string]string{}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, err
+	}
 	for _, entry := range entries {
 		if strings.HasPrefix(entry.Name(), "tidyshare_v") && !expected[entry.Name()] && entry.Name() != checksumName {
-			return fmt.Errorf("unexpected release asset %s", entry.Name())
+			return nil, fmt.Errorf("unexpected release asset %s", entry.Name())
 		}
 	}
 	for name := range expected {
 		path := filepath.Join(directory, name)
 		stat, err := os.Lstat(path)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if !stat.Mode().IsRegular() {
-			return fmt.Errorf("release asset is not a plain file: %s", name)
+			return nil, fmt.Errorf("release asset is not a plain file: %s", name)
 		}
 		checksums[name], err = hashReleaseFile(path)
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
-	if err := verifyBundle(filepath.Join(directory, archiveName), version, commit); err != nil {
-		return err
-	}
+	return checksums, nil
+}
+
+func verifyCommonChecksums(directory, checksumName string, expected map[string]bool, checksums map[string]string) error {
 	checksumPath := filepath.Join(directory, checksumName)
 	stat, err := os.Lstat(checksumPath)
 	if err != nil {
@@ -608,6 +647,69 @@ func verifyReleaseAssets(directory, version, commit string) error {
 	return nil
 }
 
+func verifyReleaseAssets(directory, version, commit string) error {
+	if err := validateBundleIdentity(version, commit); err != nil {
+		return err
+	}
+	prefix := "tidyshare_v" + version
+	checksumName := prefix + "_checksums.txt"
+	archiveName := prefix + "_agent-bundle.tar.gz"
+	expected := map[string]bool{archiveName: true}
+	goVersion := ""
+	for _, target := range []releaseTarget{{"linux", "amd64", "0"}, {"linux", "arm64", "0"}, {"darwin", "amd64", "1"}, {"darwin", "arm64", "1"}} {
+		name := prefix + "_" + target.os + "_" + target.arch
+		expected[name] = true
+		current, err := verifyReleaseBinary(directory, version, commit, goVersion, target)
+		if err != nil {
+			return err
+		}
+		goVersion = current
+	}
+	checksums, err := releaseAssetHashes(directory, checksumName, expected)
+	if err != nil {
+		return err
+	}
+	if err := verifyBundle(filepath.Join(directory, archiveName), version, commit); err != nil {
+		return err
+	}
+	return verifyCommonChecksums(directory, checksumName, expected, checksums)
+}
+
+func printBundleLinkerFlags(version, commit string, conflict bool) error {
+	if conflict {
+		return errors.New("select one operation")
+	}
+	if err := validateBundleIdentity(version, commit); err != nil {
+		return err
+	}
+	fmt.Println(releaseLDFlags(version, commit))
+	return nil
+}
+
+func recordBundleOperation(binary, receipt, version, commit, ldflags, metadata string, native, conflict bool) error {
+	if conflict || receipt == "" {
+		return errors.New("select one operation and provide a receipt path")
+	}
+	if metadata != "" {
+		if err := verifyGoReleaserMetadata(metadata, version, commit); err != nil {
+			return err
+		}
+	}
+	return recordBinaryReceipt(binary, receipt, version, commit, ldflags, native)
+}
+
+func printBundleVersion(refType, ref, commit string, conflict bool) error {
+	if conflict {
+		return errors.New("select one operation")
+	}
+	normalized, err := releaseVersion(refType, ref, commit)
+	if err != nil {
+		return err
+	}
+	fmt.Println(normalized)
+	return nil
+}
+
 func run() error {
 	flags := flag.NewFlagSet("agent-bundle", flag.ContinueOnError)
 	source := flags.String("source", "agent-bundle", "Canonical payload directory")
@@ -631,36 +733,13 @@ func run() error {
 		return errors.New("positional arguments are not supported")
 	}
 	if *printLDFlags {
-		if *refType != "" || *verify != "" || *assets != "" || *record != "" || *native || *receipt != "" || *ldflags != "" || *metadata != "" {
-			return errors.New("select one operation")
-		}
-		if err := validateBundleIdentity(*version, *commit); err != nil {
-			return err
-		}
-		fmt.Println(releaseLDFlags(*version, *commit))
-		return nil
+		return printBundleLinkerFlags(*version, *commit, *refType != "" || *verify != "" || *assets != "" || *record != "" || *native || *receipt != "" || *ldflags != "" || *metadata != "")
 	}
 	if *refType != "" {
-		if *verify != "" || *assets != "" || *record != "" {
-			return errors.New("select one operation")
-		}
-		normalized, err := releaseVersion(*refType, *ref, *commit)
-		if err != nil {
-			return err
-		}
-		fmt.Println(normalized)
-		return nil
+		return printBundleVersion(*refType, *ref, *commit, *verify != "" || *assets != "" || *record != "")
 	}
 	if *record != "" {
-		if *verify != "" || *assets != "" || *receipt == "" {
-			return errors.New("select one operation and provide a receipt path")
-		}
-		if *metadata != "" {
-			if err := verifyGoReleaserMetadata(*metadata, *version, *commit); err != nil {
-				return err
-			}
-		}
-		return recordBinaryReceipt(*record, *receipt, *version, *commit, *ldflags, *native)
+		return recordBundleOperation(*record, *receipt, *version, *commit, *ldflags, *metadata, *native, *verify != "" || *assets != "")
 	}
 	if *native || *receipt != "" || *ldflags != "" || *metadata != "" {
 		return errors.New("binary receipt options require record-binary")
