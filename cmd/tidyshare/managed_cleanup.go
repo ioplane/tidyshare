@@ -18,6 +18,8 @@ import (
 const (
 	managedEntryLimit = 100000
 	managedPlanLimit  = 64 << 20
+	managedChromeRoot = "Library/Caches/Google/Chrome"
+	managedXcodeRoot  = "Library/Developer/Xcode/DerivedData"
 )
 
 type managedIdentity struct {
@@ -124,151 +126,184 @@ func createManagedPlanWithQualifier(ctx context.Context, o managedPlanOptions, q
 		if err := ctx.Err(); err != nil {
 			return p, err
 		}
-		var paths []string
-		switch kind {
-		case "go_build", "npm":
-			for _, layout := range cacheLayouts {
-				if layout.kind == kind && (runtime.GOOS == "darwin" || !strings.HasPrefix(layout.suffix, "Library/")) {
-					paths = append(paths, filepath.Join(o.Root, layout.suffix))
-				}
-			}
-			for _, key := range []string{"GOCACHE", "NPM_CONFIG_CACHE", "npm_config_cache"} {
-				path := os.Getenv(key)
-				if kind == "npm" {
-					path = filepath.Join(path, "_cacache")
-				}
-				if filepath.IsAbs(path) && cacheWithin(o.Root, path) && cacheKind(path, false) == kind {
-					paths = append(paths, path)
-				}
-			}
-		case "homebrew":
-			paths = []string{filepath.Join(o.Root, "Library/Caches/Homebrew/downloads")}
-		case "chrome":
-			base := filepath.Join(o.Root, "Library/Caches/Google/Chrome")
-			paths, err = managedChildren(base, func(name string) []string {
-				if !managedChromeProfile(name) {
-					return nil
-				}
-				return []string{filepath.Join(name, "Cache"), filepath.Join(name, "Code Cache")}
-			})
-			if err != nil {
-				p.Targets = append(p.Targets, managedTarget{Kind: kind, Path: base, State: "blocked", Reason: err.Error(), Entries: []managedEntry{}})
-				continue
-			}
-		case "xcode":
-			base := filepath.Join(o.Root, "Library/Developer/Xcode/DerivedData")
-			paths, err = managedChildren(base, func(name string) []string {
-				return []string{filepath.Join(name, "Build/Intermediates.noindex"), filepath.Join(name, "Logs")}
-			})
-			if err != nil {
-				p.Targets = append(p.Targets, managedTarget{Kind: kind, Path: base, State: "blocked", Reason: err.Error(), Entries: []managedEntry{}})
-				continue
-			}
-		case "docker_build":
-			target := managedTarget{Kind: kind, Path: "docker-build-cache", State: "blocked", Reason: "disposable daemon and builder qualification is required; no prune capability is enabled", Scope: "daemon default build cache older than 24h; without all; no image, container or volume deletion", Entries: []managedEntry{}}
-			if o.Docker != nil {
-				if _, _, err := o.Docker.inventory(ctx); err != nil {
-					target.Reason += "; Docker observation unavailable: " + err.Error()
-				} else {
-					o.Docker.mu.Lock()
-					target.DaemonID = o.Docker.DaemonID
-					target.DockerContext = o.Docker.Context
-					o.Docker.mu.Unlock()
-				}
-			}
-			p.Targets = append(p.Targets, target)
-			continue
-		default:
-			return p, fmt.Errorf("unsupported managed kind: %s", kind)
-		}
-		sort.Strings(paths)
-		paths = uniqueStrings(paths)
-		if len(paths) == 0 && (kind == "chrome" || kind == "xcode") {
-			base := filepath.Join(o.Root, "Library/Caches/Google/Chrome")
-			if kind == "xcode" {
-				base = filepath.Join(o.Root, "Library/Developer/Xcode/DerivedData")
-			}
-			p.Targets = append(p.Targets, managedTarget{Kind: kind, Path: base, State: "absent", Reason: "no recognized cache subtrees", Entries: []managedEntry{}})
-			continue
-		}
-		for _, path := range paths {
-			target := managedTarget{Kind: kind, Path: path, State: "absent", Scope: "regular files older than 24h from the reviewed manifest", Entries: []managedEntry{}}
-			if p.Policy.overlaps(path) {
-				target.State = "blocked"
-				target.Reason = "protected by workstation policy"
-				p.Targets = append(p.Targets, target)
-				continue
-			}
-			dir, err := openPlainDirectory(path, false)
-			if errors.Is(err, os.ErrNotExist) {
-				p.Targets = append(p.Targets, target)
-				continue
-			}
-			if err != nil {
-				target.State = "blocked"
-				target.Reason = err.Error()
-				p.Targets = append(p.Targets, target)
-				continue
-			}
-			var st unix.Stat_t
-			err = unix.Fstat(int(dir.Fd()), &st)
-			target.Identity = managedStat(st)
-			if err == nil && st.Uid != uint32(os.Getuid()) {
-				err = errors.New("target belongs to another user")
-			}
-			if err == nil && (kind == "go_build" || kind == "npm") {
-				target.Scope = "native manager operation; not a file whitelist"
-				_, _, err = cacheWalk(ctx, dir, uint64(st.Dev), cacheGuardEntry(kind, path))
-				if err == nil {
-					target.Tool, err = qualify(ctx, kind)
-				}
-				if err == nil {
-					target.State = "planned"
-				}
-			} else if err == nil {
-				cutoff := p.CreatedAt.Add(-24 * time.Hour)
-				_, _, err = cacheWalk(ctx, dir, uint64(st.Dev), func(parent *os.File, name string, s unix.Stat_t) error {
-					if err := managedProjectGuard(parent, name, s); err != nil {
-						return err
-					}
-					if s.Mode&unix.S_IFMT != unix.S_IFREG {
-						return nil
-					}
-					rel, e := filepath.Rel(path, filepath.Join(parent.Name(), name))
-					if e != nil {
-						return e
-					}
-					if managedLockedName(rel) || s.Uid != uint32(os.Getuid()) || s.Nlink != 1 || !time.Unix(s.Mtim.Sec, s.Mtim.Nsec).Before(cutoff) {
-						target.Skipped++
-						return nil
-					}
-					if len(target.Entries) >= remaining {
-						return errors.New("manifest exceeds the 100000-entry plan bound")
-					}
-					target.Entries = append(target.Entries, managedEntry{Name: rel, Identity: managedStat(s)})
-					return nil
-				})
-				if err == nil {
-					target.State = "planned"
-					remaining -= len(target.Entries)
-				}
-			}
-			_ = dir.Close()
-			if err != nil {
-				target.State = "blocked"
-				target.Reason = err.Error()
-				target.Entries = []managedEntry{}
-			}
-			p.Targets = append(p.Targets, target)
-			if managedUncertain(err) {
-				return p, err
-			}
+		if err := planManagedKind(ctx, &p, o, kind, &remaining, qualify); err != nil {
+			return p, err
 		}
 	}
 	if err := ctx.Err(); err != nil {
 		return p, err
 	}
 	return p, validateManagedPlan(p, storagePolicy{})
+}
+
+func planManagedKind(ctx context.Context, p *managedPlan, o managedPlanOptions, kind string, remaining *int, qualify func(context.Context, string) (*managedTool, error)) error {
+	var err error
+	var paths []string
+	switch kind {
+	case "go_build", "npm":
+		paths = managedCachePaths(o.Root, kind)
+	case "homebrew":
+		paths = []string{filepath.Join(o.Root, "Library/Caches/Homebrew/downloads")}
+	case "chrome", "xcode":
+		var base string
+		paths, base, err = managedApplicationPaths(o.Root, kind)
+		if err != nil {
+			p.Targets = append(p.Targets, managedTarget{Kind: kind, Path: base, State: "blocked", Reason: err.Error(), Entries: []managedEntry{}})
+			return nil
+		}
+	case "docker_build":
+		p.Targets = append(p.Targets, managedDockerTarget(ctx, o.Docker))
+		return nil
+	default:
+		return fmt.Errorf("unsupported managed kind: %s", kind)
+	}
+	sort.Strings(paths)
+	paths = uniqueStrings(paths)
+	if len(paths) == 0 && (kind == "chrome" || kind == "xcode") {
+		base := filepath.Join(o.Root, managedChromeRoot)
+		if kind == "xcode" {
+			base = filepath.Join(o.Root, managedXcodeRoot)
+		}
+		p.Targets = append(p.Targets, managedTarget{Kind: kind, Path: base, State: "absent", Reason: "no recognized cache subtrees", Entries: []managedEntry{}})
+		return nil
+	}
+	for _, path := range paths {
+		target, err := planManagedTarget(ctx, p, kind, path, remaining, qualify)
+		p.Targets = append(p.Targets, target)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func managedCachePaths(root, kind string) []string {
+	var paths []string
+	for _, layout := range cacheLayouts {
+		if layout.kind == kind && (runtime.GOOS == "darwin" || !strings.HasPrefix(layout.suffix, "Library/")) {
+			paths = append(paths, filepath.Join(root, layout.suffix))
+		}
+	}
+	for _, key := range []string{"GOCACHE", "NPM_CONFIG_CACHE", "npm_config_cache"} {
+		path := os.Getenv(key)
+		if kind == "npm" {
+			path = filepath.Join(path, "_cacache")
+		}
+		if filepath.IsAbs(path) && cacheWithin(root, path) && cacheKind(path, false) == kind {
+			paths = append(paths, path)
+		}
+	}
+	return paths
+}
+
+func managedApplicationPaths(root, kind string) ([]string, string, error) {
+	if kind == "chrome" {
+		base := filepath.Join(root, managedChromeRoot)
+		paths, err := managedChildren(base, func(name string) []string {
+			if !managedChromeProfile(name) {
+				return nil
+			}
+			return []string{filepath.Join(name, "Cache"), filepath.Join(name, "Code Cache")}
+		})
+		return paths, base, err
+	}
+	base := filepath.Join(root, managedXcodeRoot)
+	paths, err := managedChildren(base, func(name string) []string {
+		return []string{filepath.Join(name, "Build/Intermediates.noindex"), filepath.Join(name, "Logs")}
+	})
+	return paths, base, err
+}
+
+func managedDockerTarget(ctx context.Context, docker *dockerStore) managedTarget {
+	target := managedTarget{Kind: "docker_build", Path: "docker-build-cache", State: "blocked", Reason: "disposable daemon and builder qualification is required; no prune capability is enabled", Scope: "daemon default build cache older than 24h; without all; no image, container or volume deletion", Entries: []managedEntry{}}
+	if docker != nil {
+		if _, _, err := docker.inventory(ctx); err != nil {
+			target.Reason += "; Docker observation unavailable: " + err.Error()
+		} else {
+			docker.mu.Lock()
+			target.DaemonID = docker.DaemonID
+			target.DockerContext = docker.Context
+			docker.mu.Unlock()
+		}
+	}
+	return target
+}
+
+func planManagedTarget(ctx context.Context, p *managedPlan, kind, path string, remaining *int, qualify func(context.Context, string) (*managedTool, error)) (managedTarget, error) {
+	target := managedTarget{Kind: kind, Path: path, State: "absent", Scope: "regular files older than 24h from the reviewed manifest", Entries: []managedEntry{}}
+	if p.Policy.overlaps(path) {
+		target.State = "blocked"
+		target.Reason = "protected by workstation policy"
+		return target, nil
+	}
+	dir, err := openPlainDirectory(path, false)
+	if errors.Is(err, os.ErrNotExist) {
+		return target, nil
+	}
+	if err != nil {
+		target.State = "blocked"
+		target.Reason = err.Error()
+		return target, nil
+	}
+	var st unix.Stat_t
+	err = unix.Fstat(int(dir.Fd()), &st)
+	target.Identity = managedStat(st)
+	if err == nil && st.Uid != uint32(os.Getuid()) {
+		err = errors.New("target belongs to another user")
+	}
+	if err == nil && (kind == "go_build" || kind == "npm") {
+		target.Scope = "native manager operation; not a file whitelist"
+		_, _, err = cacheWalk(ctx, dir, uint64(st.Dev), cacheGuardEntry(kind, path))
+		if err == nil {
+			target.Tool, err = qualify(ctx, kind)
+		}
+		if err == nil {
+			target.State = "planned"
+		}
+	} else if err == nil {
+		err = planManagedManifest(ctx, dir, st, p.CreatedAt, path, &target, remaining)
+	}
+	_ = dir.Close()
+	if err != nil {
+		target.State = "blocked"
+		target.Reason = err.Error()
+		target.Entries = []managedEntry{}
+	}
+	if managedUncertain(err) {
+		return target, err
+	}
+	return target, nil
+}
+
+func planManagedManifest(ctx context.Context, dir *os.File, st unix.Stat_t, createdAt time.Time, path string, target *managedTarget, remaining *int) error {
+
+	cutoff := createdAt.Add(-24 * time.Hour)
+	_, _, err := cacheWalk(ctx, dir, uint64(st.Dev), func(parent *os.File, name string, s unix.Stat_t) error {
+		if err := managedProjectGuard(parent, name, s); err != nil {
+			return err
+		}
+		if s.Mode&unix.S_IFMT != unix.S_IFREG {
+			return nil
+		}
+		rel, e := filepath.Rel(path, filepath.Join(parent.Name(), name))
+		if e != nil {
+			return e
+		}
+		if managedLockedName(rel) || s.Uid != uint32(os.Getuid()) || s.Nlink != 1 || !time.Unix(s.Mtim.Sec, s.Mtim.Nsec).Before(cutoff) {
+			target.Skipped++
+			return nil
+		}
+		if len(target.Entries) >= *remaining {
+			return errors.New("manifest exceeds the 100000-entry plan bound")
+		}
+		target.Entries = append(target.Entries, managedEntry{Name: rel, Identity: managedStat(s)})
+		return nil
+	})
+	if err == nil {
+		target.State = "planned"
+		*remaining -= len(target.Entries)
+	}
+	return err
 }
 
 func managedChildren(base string, children func(string) []string) ([]string, error) {
@@ -357,29 +392,37 @@ func managedTargetAllowed(root string, t managedTarget) bool {
 	case "homebrew":
 		return t.Path == filepath.Join(root, "Library/Caches/Homebrew/downloads")
 	case "chrome":
-		base := filepath.Join(root, "Library/Caches/Google/Chrome")
-		if t.Path == base {
-			return (t.State == "blocked" || t.State == "absent") && len(t.Entries) == 0
-		}
-		rel, err := filepath.Rel(base, t.Path)
-		if err != nil {
-			return false
-		}
-		parts := strings.Split(rel, string(os.PathSeparator))
-		return len(parts) == 2 && managedChromeProfile(parts[0]) && (parts[1] == "Cache" || parts[1] == "Code Cache")
+		return managedChromeTargetAllowed(root, t)
 	case "xcode":
-		base := filepath.Join(root, "Library/Developer/Xcode/DerivedData")
-		if t.Path == base {
-			return (t.State == "blocked" || t.State == "absent") && len(t.Entries) == 0
-		}
-		rel, err := filepath.Rel(base, t.Path)
-		if err != nil {
-			return false
-		}
-		parts := strings.Split(rel, string(os.PathSeparator))
-		return len(parts) >= 2 && parts[0] != ".." && (len(parts) == 2 && parts[1] == "Logs" || len(parts) == 3 && parts[1] == "Build" && parts[2] == "Intermediates.noindex")
+		return managedXcodeTargetAllowed(root, t)
 	}
 	return false
+}
+
+func managedChromeTargetAllowed(root string, t managedTarget) bool {
+	base := filepath.Join(root, managedChromeRoot)
+	if t.Path == base {
+		return (t.State == "blocked" || t.State == "absent") && len(t.Entries) == 0
+	}
+	rel, err := filepath.Rel(base, t.Path)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(os.PathSeparator))
+	return len(parts) == 2 && managedChromeProfile(parts[0]) && (parts[1] == "Cache" || parts[1] == "Code Cache")
+}
+
+func managedXcodeTargetAllowed(root string, t managedTarget) bool {
+	base := filepath.Join(root, managedXcodeRoot)
+	if t.Path == base {
+		return (t.State == "blocked" || t.State == "absent") && len(t.Entries) == 0
+	}
+	rel, err := filepath.Rel(base, t.Path)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(os.PathSeparator))
+	return len(parts) >= 2 && parts[0] != ".." && (len(parts) == 2 && parts[1] == "Logs" || len(parts) == 3 && parts[1] == "Build" && parts[2] == "Intermediates.noindex")
 }
 
 func validateManagedPlan(p managedPlan, mandatory storagePolicy) error {
@@ -396,34 +439,49 @@ func validateManagedPlan(p managedPlan, mandatory storagePolicy) error {
 	}
 	count := 0
 	for i, t := range p.Targets {
-		if !managedTargetAllowed(p.Root, t) || (t.State != "planned" && t.State != "blocked" && t.State != "absent") || t.Entries == nil {
-			return errors.New("invalid managed target kind, scope or state")
+		if err := validateManagedTarget(p, t, p.Targets[:i], policy, mandatory, &count); err != nil {
+			return err
 		}
-		if t.State == "planned" && (policy.overlaps(t.Path) || mandatory.overlaps(t.Path) || t.Identity.Inode == 0 || t.Identity.UID != uint32(os.Getuid()) || t.Identity.Mode&unix.S_IFMT != unix.S_IFDIR) {
-			return errors.New("managed target is protected or has invalid identity")
+	}
+	return nil
+}
+
+func validateManagedTarget(p managedPlan, t managedTarget, previous []managedTarget, policy, mandatory storagePolicy, count *int) error {
+	if !managedTargetAllowed(p.Root, t) || (t.State != "planned" && t.State != "blocked" && t.State != "absent") || t.Entries == nil {
+		return errors.New("invalid managed target kind, scope or state")
+	}
+	if t.State == "planned" && (policy.overlaps(t.Path) || mandatory.overlaps(t.Path) || t.Identity.Inode == 0 || t.Identity.UID != uint32(os.Getuid()) || t.Identity.Mode&unix.S_IFMT != unix.S_IFDIR) {
+		return errors.New("managed target is protected or has invalid identity")
+	}
+	if err := validateManagedScope(t); err != nil {
+		return err
+	}
+	for _, other := range previous {
+		if cacheWithin(other.Path, t.Path) || cacheWithin(t.Path, other.Path) {
+			return errors.New("managed targets overlap")
 		}
-		if t.State == "planned" {
-			if t.Kind == "go_build" || t.Kind == "npm" {
-				if t.Tool == nil || t.Tool.Version == "" || len(t.Tool.SHA256) != 64 || len(t.Entries) != 0 || t.Scope != "native manager operation; not a file whitelist" {
-					return errors.New("invalid native manager qualification or scope")
-				}
-			} else if t.Tool != nil || t.Scope != "regular files older than 24h from the reviewed manifest" {
-				return errors.New("invalid manifest operation scope")
-			}
+	}
+	seen := map[string]bool{}
+	for _, e := range t.Entries {
+		*count++
+		if *count > managedEntryLimit || e.Name == "." || filepath.IsAbs(e.Name) || filepath.Clean(e.Name) != e.Name || e.Name == ".." || strings.HasPrefix(e.Name, ".."+string(os.PathSeparator)) || managedLockedName(e.Name) || managedProjectPath(e.Name) || seen[e.Name] || e.Identity.Device != t.Identity.Device || e.Identity.UID != t.Identity.UID || e.Identity.Inode == 0 || e.Identity.Links != 1 || e.Identity.Mode&unix.S_IFMT != unix.S_IFREG || e.Identity.Size < 0 || !time.Unix(e.Identity.Mtime.Sec, e.Identity.Mtime.Nsec).Before(p.CreatedAt.Add(-24*time.Hour)) {
+			return errors.New("invalid managed manifest entry")
 		}
-		for _, other := range p.Targets[:i] {
-			if cacheWithin(other.Path, t.Path) || cacheWithin(t.Path, other.Path) {
-				return errors.New("managed targets overlap")
-			}
+		seen[e.Name] = true
+	}
+	return nil
+}
+
+func validateManagedScope(t managedTarget) error {
+	if t.State != "planned" {
+		return nil
+	}
+	if t.Kind == "go_build" || t.Kind == "npm" {
+		if t.Tool == nil || t.Tool.Version == "" || len(t.Tool.SHA256) != 64 || len(t.Entries) != 0 || t.Scope != "native manager operation; not a file whitelist" {
+			return errors.New("invalid native manager qualification or scope")
 		}
-		seen := map[string]bool{}
-		for _, e := range t.Entries {
-			count++
-			if count > managedEntryLimit || e.Name == "." || filepath.IsAbs(e.Name) || filepath.Clean(e.Name) != e.Name || e.Name == ".." || strings.HasPrefix(e.Name, ".."+string(os.PathSeparator)) || managedLockedName(e.Name) || managedProjectPath(e.Name) || seen[e.Name] || e.Identity.Device != t.Identity.Device || e.Identity.UID != t.Identity.UID || e.Identity.Inode == 0 || e.Identity.Links != 1 || e.Identity.Mode&unix.S_IFMT != unix.S_IFREG || e.Identity.Size < 0 || !time.Unix(e.Identity.Mtime.Sec, e.Identity.Mtime.Nsec).Before(p.CreatedAt.Add(-24*time.Hour)) {
-				return errors.New("invalid managed manifest entry")
-			}
-			seen[e.Name] = true
-		}
+	} else if t.Tool != nil || t.Scope != "regular files older than 24h from the reviewed manifest" {
+		return errors.New("invalid manifest operation scope")
 	}
 	return nil
 }

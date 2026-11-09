@@ -111,54 +111,12 @@ func darwinCheckProcess(ctx context.Context, path string, pid int, ownFDs []uint
 			return err
 		}
 	}
-	for _, kind := range []int{darwinFDs, darwinFileports} {
-		entries, err := darwinReadList(kind, pid, api.list)
-		if err != nil {
-			return fmt.Errorf("cannot inspect process %d descriptors (list %d): %w", pid, kind, err)
-		}
-		for _, entry := range entries {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			fd, fdType := uint32(entry), uint32(entry>>32)
-			if fdType != 1 {
-				if fdType > 11 || fdType == 8 {
-					return fmt.Errorf("cannot inspect descriptor type %d for process %d", fdType, pid)
-				}
-				continue
-			}
-			if kind == darwinFDs && pid == os.Getpid() && slices.Contains(ownFDs, uintptr(fd)) {
-				continue
-			}
-			queryKind := darwinFDPath
-			if kind == darwinFileports {
-				queryKind = darwinFileportPath
-			}
-			if _, err := query(queryKind, uint64(fd)); err != nil {
-				return err
-			}
-		}
+	if err := darwinCheckDescriptors(ctx, pid, ownFDs, api, query); err != nil {
+		return err
 	}
-	var address uint64
-	unresolved := false
-	for regions := 0; ; regions++ {
-		if regions == 1<<20 {
-			return errors.New("cannot inspect complete process memory maps")
-		}
-		region, err := query(darwinRegion, address)
-		// libproc returns EINVAL when no region remains. An initial EINVAL proves no traversal.
-		if errors.Is(err, unix.EINVAL) && regions > 0 {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		unresolved = unresolved || region.flags != 0
-		next := region.address + region.size
-		if region.size == 0 || region.address < address || next <= region.address {
-			return errors.New("cannot inspect complete process memory maps")
-		}
-		address = next
+	unresolved, err := darwinCheckRegions(query)
+	if err != nil {
+		return err
 	}
 	after, err := query(darwinIdentity, 0)
 	if err != nil {
@@ -171,6 +129,68 @@ func darwinCheckProcess(ctx context.Context, path string, pid int, ownFDs []uint
 		return fmt.Errorf("cannot resolve all mapped files for process %d", pid)
 	}
 	return nil
+}
+
+func darwinCheckDescriptors(ctx context.Context, pid int, ownFDs []uintptr, api darwinProcAPI, query func(int, uint64) (darwinProcResult, error)) error {
+	for _, kind := range []int{darwinFDs, darwinFileports} {
+		entries, err := darwinReadList(kind, pid, api.list)
+		if err != nil {
+			return fmt.Errorf("cannot inspect process %d descriptors (list %d): %w", pid, kind, err)
+		}
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := darwinCheckDescriptor(pid, kind, entry, ownFDs, query); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func darwinCheckDescriptor(pid, kind int, entry uint64, ownFDs []uintptr, query func(int, uint64) (darwinProcResult, error)) error {
+	fd, fdType := uint32(entry), uint32(entry>>32)
+	if fdType != 1 {
+		if fdType > 11 || fdType == 8 {
+			return fmt.Errorf("cannot inspect descriptor type %d for process %d", fdType, pid)
+		}
+		return nil
+	}
+	if kind == darwinFDs && pid == os.Getpid() && slices.Contains(ownFDs, uintptr(fd)) {
+		return nil
+	}
+	queryKind := darwinFDPath
+	if kind == darwinFileports {
+		queryKind = darwinFileportPath
+	}
+	_, err := query(queryKind, uint64(fd))
+	return err
+}
+
+func darwinCheckRegions(query func(int, uint64) (darwinProcResult, error)) (bool, error) {
+	var address uint64
+	unresolved := false
+	for regions := 0; ; regions++ {
+		if regions == 1<<20 {
+			return false, errors.New("cannot inspect complete process memory maps")
+		}
+		region, err := query(darwinRegion, address)
+		// libproc returns EINVAL when no region remains. An initial EINVAL proves no traversal.
+		if errors.Is(err, unix.EINVAL) && regions > 0 {
+			break
+		}
+		if err != nil {
+			return false, err
+		}
+		unresolved = unresolved || region.flags != 0
+		next := region.address + region.size
+		if region.size == 0 || region.address < address || next <= region.address {
+			return false, errors.New("cannot inspect complete process memory maps")
+		}
+		address = next
+	}
+	return unresolved, nil
 }
 
 func cacheBusy(ctx context.Context, path string, ownFDs []uintptr) error {
@@ -216,6 +236,19 @@ func cacheMountGuard(path string) error {
 	return darwinMountGuard(path, unix.Getfsstat)
 }
 
+func darwinCheckMounts(path string, mounts []unix.Statfs_t) error {
+	for _, mount := range mounts {
+		point := unix.ByteSliceToString(mount.Mntonname[:])
+		if !filepath.IsAbs(point) || len(point) >= len(mount.Mntonname)-1 {
+			return errors.New("invalid mount path")
+		}
+		if point != path && darwinPathWithin(path, point) {
+			return errors.New("cache contains a nested mount")
+		}
+	}
+	return nil
+}
+
 func darwinMountGuard(path string, list func([]unix.Statfs_t, int) (int, error)) error {
 	count, err := list(nil, unix.MNT_NOWAIT)
 	if err != nil || count <= 0 || count > 1<<14 {
@@ -233,16 +266,7 @@ func darwinMountGuard(path string, list func([]unix.Statfs_t, int) (int, error))
 		if n == len(mounts) {
 			continue
 		}
-		for _, mount := range mounts[:n] {
-			point := unix.ByteSliceToString(mount.Mntonname[:])
-			if !filepath.IsAbs(point) || len(point) >= len(mount.Mntonname)-1 {
-				return errors.New("invalid mount path")
-			}
-			if point != path && darwinPathWithin(path, point) {
-				return errors.New("cache contains a nested mount")
-			}
-		}
-		return nil
+		return darwinCheckMounts(path, mounts[:n])
 	}
 	return errors.New("cannot inspect complete mount inventory")
 }

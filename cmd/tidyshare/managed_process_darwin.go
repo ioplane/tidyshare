@@ -13,7 +13,9 @@ static int tidyshare_observe_child(int pid, int *exited) {
 }
 */
 import "C"
-import "syscall"
+import (
+	"syscall"
+)
 
 func managedProcessCapability() error { return nil }
 func waitManagedLeader(pid int) (bool, error) {

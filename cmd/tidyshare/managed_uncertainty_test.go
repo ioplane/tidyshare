@@ -68,40 +68,43 @@ func TestManagedExecutionUncertaintyStopsBeforeLaterTargets(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, when := range []string{"before-action", "after-possible-action"} {
-		t.Run(when, func(t *testing.T) {
-			cause := &managedStopError{Cause: errors.New("fixture stop failure"), Roots: []string{"retained-owned-fixture"}, PID: 123}
-			calls := 0
-			native := managedNativeOps{
-				busy: func(context.Context, managedTarget) error {
-					calls++
-					if when == "before-action" {
-						return cause
-					}
-					return nil
-				},
-				qualify: func(context.Context, string) (*managedTool, error) { return tool, nil },
-				run: func(context.Context, managedTarget, *managedTool) (managedCommandResult, error) {
-					return managedCommandResult{ExitCode: -1}, cause
-				},
+		t.Run(when, func(t *testing.T) { checkManagedExecutionUncertainty(t, p, tool, later, when) })
+	}
+}
+
+func checkManagedExecutionUncertainty(t *testing.T, p managedPlan, tool *managedTool, later, when string) {
+	t.Helper()
+	cause := &managedStopError{Cause: errors.New("fixture stop failure"), Roots: []string{"retained-owned-fixture"}, PID: 123}
+	calls := 0
+	native := managedNativeOps{
+		busy: func(context.Context, managedTarget) error {
+			calls++
+			if when == "before-action" {
+				return cause
 			}
-			selected := []string{}
-			for _, target := range p.Targets {
-				if target.State == "planned" {
-					selected = append(selected, target.Path)
-				}
-			}
-			digest := strings.Repeat("a", 64)
-			report, err := executeManagedPlanWithNative(context.Background(), p, digest, managedExecuteOptions{Execute: true, ExpectedDigest: digest, Targets: selected, Journal: managedFixtureJournal(t)}, native)
-			want := "blocked"
-			if when == "after-possible-action" {
-				want = "partial"
-			}
-			if !errors.Is(err, cause) || calls != 1 || len(report.Results) != 1 || report.Results[0].Status != want || len(report.FilesystemAfter) != 0 {
-				t.Fatalf("uncertainty not fail-fast: %+v calls=%d err=%v", report, calls, err)
-			}
-			if _, err := os.Stat(later); err != nil {
-				t.Fatal("later target changed")
-			}
-		})
+			return nil
+		},
+		qualify: func(context.Context, string) (*managedTool, error) { return tool, nil },
+		run: func(context.Context, managedTarget, *managedTool) (managedCommandResult, error) {
+			return managedCommandResult{ExitCode: -1}, cause
+		},
+	}
+	selected := []string{}
+	for _, target := range p.Targets {
+		if target.State == "planned" {
+			selected = append(selected, target.Path)
+		}
+	}
+	digest := strings.Repeat("a", 64)
+	report, err := executeManagedPlanWithNative(context.Background(), p, digest, managedExecuteOptions{Execute: true, ExpectedDigest: digest, Targets: selected, Journal: managedFixtureJournal(t)}, native)
+	want := "blocked"
+	if when == "after-possible-action" {
+		want = "partial"
+	}
+	if !errors.Is(err, cause) || calls != 1 || len(report.Results) != 1 || report.Results[0].Status != want || len(report.FilesystemAfter) != 0 {
+		t.Fatalf("uncertainty not fail-fast: %+v calls=%d err=%v", report, calls, err)
+	}
+	if _, err := os.Stat(later); err != nil {
+		t.Fatal("later target changed")
 	}
 }

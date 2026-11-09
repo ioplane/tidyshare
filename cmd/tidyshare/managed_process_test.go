@@ -30,19 +30,7 @@ func TestManagedCommandStopsDescendants(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			pidfile := filepath.Join(t.TempDir(), "child")
 			t.Cleanup(func() {
-				if b, e := os.ReadFile(pidfile); e == nil {
-					pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
-					if pid > 0 {
-						until := time.Now().Add(10 * time.Second)
-						for !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
-							if time.Now().After(until) {
-								t.Errorf("finite owned fixture remains: %d", pid)
-								break
-							}
-							time.Sleep(10 * time.Millisecond)
-						}
-					}
-				}
+				waitManagedFixture(t, pidfile)
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), tc.timeout)
 			defer cancel()
@@ -62,6 +50,23 @@ func TestManagedCommandStopsDescendants(t *testing.T) {
 				t.Fatalf("descendant %d remains after return: %v", pid, e)
 			}
 		})
+	}
+}
+
+func waitManagedFixture(t *testing.T, pidfile string) {
+	t.Helper()
+	if b, e := os.ReadFile(pidfile); e == nil {
+		pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+		if pid > 0 {
+			until := time.Now().Add(10 * time.Second)
+			for !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+				if time.Now().After(until) {
+					t.Errorf("finite owned fixture remains: %d", pid)
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
 	}
 }
 

@@ -104,47 +104,50 @@ func TestManagedExecutionCanaryAndSymlinkReplacement(t *testing.T) {
 
 func TestManagedNativeQualificationAndConfigurationIsolation(t *testing.T) {
 	for _, kind := range []string{"go_build", "npm"} {
-		t.Run(kind, func(t *testing.T) {
-			root, _ := inventoryFixture(t)
-			bad := filepath.Join(root, "bad.js")
-			marker := filepath.Join(root, "injected")
-			if err := os.WriteFile(bad, []byte("require('fs').writeFileSync("+strconvQuoteForFixture(marker)+",'bad')"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			t.Setenv("NODE_OPTIONS", "--require="+bad)
-			name := "go"
-			if kind == "npm" {
-				name = "npm"
-			}
-			if _, err := exec.LookPath(name); err != nil {
-				t.Skipf("manager unavailable: %v", err)
-			}
-			tool, err := qualifyManagedTool(context.Background(), kind)
-			if err != nil {
-				t.Fatal(err)
-			}
-			cache := filepath.Join(root, "cache")
-			seed := filepath.Join(cache, "00/fixture-a")
-			if kind == "npm" {
-				cache = filepath.Join(root, "npm/_cacache")
-				seed = filepath.Join(cache, "content-v2/sha512/00/fixture")
-			}
-			write(t, seed, "owned", 48*time.Hour)
-			result, err := runManagedNative(context.Background(), managedTarget{Kind: kind, Path: cache}, tool)
-			if err != nil || result.ExitCode != 0 {
-				t.Fatalf("native result %+v %v", result, err)
-			}
-			if _, err := os.Stat(seed); !os.IsNotExist(err) {
-				t.Fatal("native fixture was not cleared")
-			}
-			if _, err := os.Stat(marker); !os.IsNotExist(err) {
-				t.Fatal("ambient NODE_OPTIONS executed")
-			}
-			tool.SHA256 = strings.Repeat("0", 64)
-			if _, err := runManagedNative(context.Background(), managedTarget{Kind: kind, Path: cache}, tool); err == nil {
-				t.Fatal("modified executable digest accepted")
-			}
-		})
+		t.Run(kind, func(t *testing.T) { checkManagedNativeIsolation(t, kind) })
+	}
+}
+
+func checkManagedNativeIsolation(t *testing.T, kind string) {
+	t.Helper()
+	root, _ := inventoryFixture(t)
+	bad := filepath.Join(root, "bad.js")
+	marker := filepath.Join(root, "injected")
+	if err := os.WriteFile(bad, []byte("require('fs').writeFileSync("+strconvQuoteForFixture(marker)+",'bad')"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NODE_OPTIONS", "--require="+bad)
+	name := "go"
+	if kind == "npm" {
+		name = "npm"
+	}
+	if _, err := exec.LookPath(name); err != nil {
+		t.Skipf("manager unavailable: %v", err)
+	}
+	tool, err := qualifyManagedTool(context.Background(), kind)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := filepath.Join(root, "cache")
+	seed := filepath.Join(cache, "00/fixture-a")
+	if kind == "npm" {
+		cache = filepath.Join(root, "npm/_cacache")
+		seed = filepath.Join(cache, "content-v2/sha512/00/fixture")
+	}
+	write(t, seed, "owned", 48*time.Hour)
+	result, err := runManagedNative(context.Background(), managedTarget{Kind: kind, Path: cache}, tool)
+	if err != nil || result.ExitCode != 0 {
+		t.Fatalf("native result %+v %v", result, err)
+	}
+	if _, err := os.Stat(seed); !os.IsNotExist(err) {
+		t.Fatal("native fixture was not cleared")
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatal("ambient NODE_OPTIONS executed")
+	}
+	tool.SHA256 = strings.Repeat("0", 64)
+	if _, err := runManagedNative(context.Background(), managedTarget{Kind: kind, Path: cache}, tool); err == nil {
+		t.Fatal("modified executable digest accepted")
 	}
 }
 

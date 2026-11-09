@@ -149,7 +149,29 @@ func runOwnedCommand(ctx context.Context, cmd *exec.Cmd, ops managedProcessOps) 
 	if ops.killLeader == nil {
 		ops.killLeader = cmd.Process.Kill
 	}
-	leaderExited := false
+	leaderExited, err := observeOwnedCommand(ctx, cmd, ops, pipes, pid)
+	if err != nil {
+		return false, err
+	}
+	stopErr := ops.signal(pid, syscall.SIGKILL)
+	if errors.Is(stopErr, syscall.ESRCH) {
+		stopErr = nil
+	}
+	if stopErr != nil && !leaderExited {
+		// Successful waitid still reserves this direct child's PID for its sole owner.
+		if directErr := ops.killLeader(); directErr != nil {
+			_ = finishManagedPipes(pipes, true)
+			done := make(chan struct{})
+			go func() { _ = cmd.Wait(); close(done) }()
+			return false, &managedStopError{Cause: errors.Join(stopErr, directErr, ctx.Err()), PID: pid, reaped: done}
+		}
+	}
+	waitErr := cmd.Wait()
+	copyErr := finishManagedPipes(pipes, false)
+	return awaitManagedGroup(ctx, ops, pid, stopErr, waitErr, copyErr)
+}
+
+func observeOwnedCommand(ctx context.Context, cmd *exec.Cmd, ops managedProcessOps, pipes []managedPipe, pid int) (bool, error) {
 	for {
 		exited, observeErr := ops.observe(pid)
 		if errors.Is(observeErr, syscall.EINTR) {
@@ -167,29 +189,16 @@ func runOwnedCommand(ctx context.Context, cmd *exec.Cmd, ops managedProcessOps) 
 			return false, &managedStopError{Cause: observeErr, PID: pid, reaped: done}
 		}
 		if exited || ctx.Err() != nil {
-			leaderExited = exited
-			break
+			return exited, nil
 		}
 		select {
 		case <-ctx.Done():
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
-	stopErr := ops.signal(pid, syscall.SIGKILL)
-	if errors.Is(stopErr, syscall.ESRCH) {
-		stopErr = nil
-	}
-	if stopErr != nil && !leaderExited {
-		// Successful waitid still reserves this direct child's PID for its sole owner.
-		if directErr := ops.killLeader(); directErr != nil {
-			_ = finishManagedPipes(pipes, true)
-			done := make(chan struct{})
-			go func() { _ = cmd.Wait(); close(done) }()
-			return false, &managedStopError{Cause: errors.Join(stopErr, directErr, ctx.Err()), PID: pid, reaped: done}
-		}
-	}
-	waitErr := cmd.Wait()
-	copyErr := finishManagedPipes(pipes, false)
+}
+
+func awaitManagedGroup(ctx context.Context, ops managedProcessOps, pid int, stopErr, waitErr, copyErr error) (bool, error) {
 	until := time.Now().Add(2 * time.Second)
 	for {
 		observation := ops.signal(pid, 0)

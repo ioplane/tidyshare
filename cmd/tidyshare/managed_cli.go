@@ -19,6 +19,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const (
+	managedPlanJSON    = "managed-plan.json"
+	managedCleanupJSON = "managed-cleanup.json"
+	reviewedPlanJSON   = "reviewed-plan.json"
+)
+
 func readManagedPlanData(path string) (managedPlan, []byte, error) {
 	var p managedPlan
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
@@ -48,8 +54,7 @@ func readManagedPlanData(path string) (managedPlan, []byte, error) {
 	if err := decoder.Decode(&p); err != nil {
 		return p, nil, err
 	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
+	if err := decoder.Decode(new(any)); err != io.EOF {
 		return p, nil, errors.New("managed plan contains trailing data")
 	}
 	if err := validateManagedPlan(p, storagePolicy{}); err != nil {
@@ -100,15 +105,15 @@ func writeManagedPlanReports(out string, p managedPlan) (string, error) {
 	if len(data) > managedPlanLimit {
 		return "", errors.New("serialized managed plan exceeds 64 MiB")
 	}
-	files, closeFiles, err := reserveReports(out, []string{"managed-plan.json", "managed-plan.md"})
+	files, closeFiles, err := reserveReports(out, []string{managedPlanJSON, "managed-plan.md"})
 	if err != nil {
 		return "", err
 	}
 	defer closeFiles()
-	if _, err := files["managed-plan.json"].Write(data); err != nil {
+	if _, err := files[managedPlanJSON].Write(data); err != nil {
 		return "", err
 	}
-	if err := files["managed-plan.json"].Sync(); err != nil {
+	if err := files[managedPlanJSON].Sync(); err != nil {
 		return "", err
 	}
 	digest := managedDigest(data)
@@ -133,15 +138,15 @@ func managedCleanReports(ctx context.Context, out string, p managedPlan, data []
 	if err := managedReportDirectory(out, p); err != nil {
 		return managedExecutionReport{}, err
 	}
-	files, closeFiles, err := reserveReports(out, []string{"managed-cleanup.json", "managed-cleanup.md", "managed-results.jsonl", "reviewed-plan.json"})
+	files, closeFiles, err := reserveReports(out, []string{managedCleanupJSON, "managed-cleanup.md", "managed-results.jsonl", reviewedPlanJSON})
 	if err != nil {
 		return managedExecutionReport{}, err
 	}
 	defer closeFiles()
-	if _, err := files["reviewed-plan.json"].Write(data); err != nil {
+	if _, err := files[reviewedPlanJSON].Write(data); err != nil {
 		return managedExecutionReport{}, err
 	}
-	if err := files["reviewed-plan.json"].Sync(); err != nil {
+	if err := files[reviewedPlanJSON].Sync(); err != nil {
 		return managedExecutionReport{}, err
 	}
 	if err := syncManagedReportDirectory(out); err != nil {
@@ -149,10 +154,10 @@ func managedCleanReports(ctx context.Context, out string, p managedPlan, data []
 	}
 	o.Journal = files["managed-results.jsonl"]
 	r, runErr := executeManagedPlan(ctx, p, managedDigest(data), o)
-	if err := json.NewEncoder(files["managed-cleanup.json"]).Encode(r); err != nil {
+	if err := json.NewEncoder(files[managedCleanupJSON]).Encode(r); err != nil {
 		return r, errors.Join(runErr, err)
 	}
-	if err := files["managed-cleanup.json"].Sync(); err != nil {
+	if err := files[managedCleanupJSON].Sync(); err != nil {
 		return r, errors.Join(runErr, err)
 	}
 	if err := writeManagedCleanupMarkdown(files["managed-cleanup.md"], r); err != nil {

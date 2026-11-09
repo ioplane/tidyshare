@@ -54,34 +54,8 @@ func managedFailureTool(t *testing.T) (string, func(string, string), func()) {
 		once.Do(func() {
 			data, _ := os.ReadFile(filepath.Join(bin, "pids"))
 			for _, row := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-				values := strings.Fields(row)
-				if len(values) != 3 {
-					continue
-				}
-				until := time.Now().Add(8 * time.Second)
-				for {
-					gone := true
-					for i, value := range values {
-						pid, e := strconv.Atoi(value)
-						if e != nil || pid <= 0 {
-							t.Errorf("invalid fixture PID")
-							return
-						}
-						if i == 2 {
-							pid = -pid
-						}
-						if !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
-							gone = false
-						}
-					}
-					if gone {
-						break
-					}
-					if time.Now().After(until) {
-						t.Errorf("owned fixture did not stop: %s", row)
-						break
-					}
-					time.Sleep(10 * time.Millisecond)
+				if !awaitManagedFailureRow(t, row) {
+					return
 				}
 			}
 		})
@@ -92,6 +66,40 @@ func managedFailureTool(t *testing.T) (string, func(string, string), func()) {
 			t.Fatal(err)
 		}
 	}, await
+}
+
+func awaitManagedFailureRow(t *testing.T, row string) bool {
+	t.Helper()
+	values := strings.Fields(row)
+	if len(values) != 3 {
+		return true
+	}
+	until := time.Now().Add(8 * time.Second)
+	for {
+		gone := true
+		for i, value := range values {
+			pid, e := strconv.Atoi(value)
+			if e != nil || pid <= 0 {
+				t.Errorf("invalid fixture PID")
+				return false
+			}
+			if i == 2 {
+				pid = -pid
+			}
+			if !errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
+				gone = false
+			}
+		}
+		if gone {
+			break
+		}
+		if time.Now().After(until) {
+			t.Errorf("owned fixture did not stop: %s", row)
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return true
 }
 
 func checkManagedRetainedRoots(t *testing.T, scratch, diagnostic string, want int) {
@@ -116,68 +124,71 @@ func checkManagedRetainedRoots(t *testing.T, scratch, diagnostic string, want in
 func TestManagedPlanningUncertaintyCLIAndMCP(t *testing.T) {
 	binary := tidyshareTestBinary(t)
 	for _, transport := range []string{"cli", "mcp"} {
-		t.Run(transport, func(t *testing.T) {
-			root, out := inventoryFixture(t)
-			write(t, filepath.Join(root, ".cache/go-build/00/fixture-a"), "owned", 48*time.Hour)
-			write(t, filepath.Join(root, ".npm/_cacache/content-v2/fixture"), "owned", 48*time.Hour)
-			bin, mode, await := managedFailureTool(t)
-			defer await()
-			mode("qualification", "")
-			scratch := t.TempDir()
-			environment := append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "TMPDIR="+scratch)
-			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-			defer cancel()
-			diagnostic := ""
-			if transport == "cli" {
-				command := exec.CommandContext(ctx, binary, "managed-plan", "-root", root, "-out", out, "-kind", "go_build", "-kind", "npm")
-				command.Env = environment
-				output, err := command.CombinedOutput()
-				diagnostic = string(output)
-				if err == nil {
-					t.Fatalf("uncertain CLI plan succeeded: %s", output)
-				}
-				if strings.Contains(diagnostic, "managed plan SHA-256:") {
-					t.Fatalf("usable digest exposed: %s", output)
-				}
-			} else {
-				command := exec.CommandContext(ctx, binary, "mcp", "-root", root, "-out", out)
-				command.Env = environment
-				client := mcp.NewClient(&mcp.Implementation{Name: "owned-uncertainty-test", Version: "1"}, nil)
-				session, err := client.Connect(ctx, &mcp.CommandTransport{Command: command}, nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer session.Close()
-				result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "plan_managed_cleanup", Arguments: map[string]any{"kinds": []string{"go_build", "npm"}}})
-				if err != nil {
-					t.Fatal(err)
-				}
-				data, err := json.Marshal(result.StructuredContent)
-				if err != nil {
-					t.Fatal(err)
-				}
-				var operation mcpOperationResult
-				if err := json.Unmarshal(data, &operation); err != nil {
-					t.Fatal(err)
-				}
-				diagnostic = operation.Summary
-				if !result.IsError || operation.PlanSHA256 != "" || len(operation.Reports) != 0 {
-					t.Fatalf("usable MCP plan exposed: %+v", result)
-				}
-			}
-			entries, err := os.ReadDir(out)
-			if err != nil && !os.IsNotExist(err) {
-				t.Fatal(err)
-			}
-			if len(entries) != 0 {
-				t.Fatalf("uncertain plan published reports: %v", entries)
-			}
-			checkManagedRetainedRoots(t, scratch, diagnostic, 2)
-			calls, _ := os.ReadFile(filepath.Join(bin, "calls"))
-			if strings.Count(string(calls), "\n") != 1 || strings.Contains(string(calls), "node-start") {
-				t.Fatalf("next native target observed: %s", calls)
-			}
-		})
+		t.Run(transport, func(t *testing.T) { checkManagedPlanningUncertainty(t, binary, transport) })
+	}
+}
+
+func checkManagedPlanningUncertainty(t *testing.T, binary, transport string) {
+	t.Helper()
+	root, out := inventoryFixture(t)
+	write(t, filepath.Join(root, ".cache/go-build/00/fixture-a"), "owned", 48*time.Hour)
+	write(t, filepath.Join(root, ".npm/_cacache/content-v2/fixture"), "owned", 48*time.Hour)
+	bin, mode, await := managedFailureTool(t)
+	defer await()
+	mode("qualification", "")
+	scratch := t.TempDir()
+	environment := append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"), "TMPDIR="+scratch)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	diagnostic := ""
+	if transport == "cli" {
+		command := exec.CommandContext(ctx, binary, "managed-plan", "-root", root, "-out", out, "-kind", "go_build", "-kind", "npm")
+		command.Env = environment
+		output, err := command.CombinedOutput()
+		diagnostic = string(output)
+		if err == nil {
+			t.Fatalf("uncertain CLI plan succeeded: %s", output)
+		}
+		if strings.Contains(diagnostic, "managed plan SHA-256:") {
+			t.Fatalf("usable digest exposed: %s", output)
+		}
+	} else {
+		command := exec.CommandContext(ctx, binary, "mcp", "-root", root, "-out", out)
+		command.Env = environment
+		client := mcp.NewClient(&mcp.Implementation{Name: "owned-uncertainty-test", Version: "1"}, nil)
+		session, err := client.Connect(ctx, &mcp.CommandTransport{Command: command}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer session.Close()
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "plan_managed_cleanup", Arguments: map[string]any{"kinds": []string{"go_build", "npm"}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(result.StructuredContent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var operation mcpOperationResult
+		if err := json.Unmarshal(data, &operation); err != nil {
+			t.Fatal(err)
+		}
+		diagnostic = operation.Summary
+		if !result.IsError || operation.PlanSHA256 != "" || len(operation.Reports) != 0 {
+			t.Fatalf("usable MCP plan exposed: %+v", result)
+		}
+	}
+	entries, err := os.ReadDir(out)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("uncertain plan published reports: %v", entries)
+	}
+	checkManagedRetainedRoots(t, scratch, diagnostic, 2)
+	calls, _ := os.ReadFile(filepath.Join(bin, "calls"))
+	if strings.Count(string(calls), "\n") != 1 || strings.Contains(string(calls), "node-start") {
+		t.Fatalf("next native target observed: %s", calls)
 	}
 }
 

@@ -71,29 +71,8 @@ func managedOpenTarget(t managedTarget) (*os.File, error) {
 // These observations cover visible processes and open FDs, not all memory consumers or future opens.
 func managedBusy(ctx context.Context, target managedTarget) error {
 	if target.Kind == "chrome" || target.Kind == "xcode" {
-		result, err := managedCommand(ctx, "/bin/ps", []string{"-axo", "pid=,uid=,comm="}, []string{"PATH=/usr/bin:/bin", "LANG=C"}, "/")
-		if err != nil {
-			if managedUncertain(err) {
-				return fmt.Errorf("application process observation: %w", err)
-			}
-			return errors.New("application process observation is unavailable")
-		}
-		for _, line := range strings.Split(result.Stdout, "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 3 {
-				continue
-			}
-			uid, err := strconv.ParseUint(fields[1], 10, 32)
-			if err != nil {
-				return errors.New("application process observation is malformed")
-			}
-			if uint32(uid) != target.Identity.UID {
-				continue
-			}
-			name := strings.ToLower(strings.Join(fields[2:], " "))
-			if target.Kind == "chrome" && strings.Contains(name, "google chrome") || target.Kind == "xcode" && (strings.Contains(name, "xcode.app") || strings.HasSuffix(name, "/xcodebuild")) {
-				return errors.New("application consumer is running; preserve this category")
-			}
+		if err := managedApplicationBusy(ctx, target); err != nil {
+			return err
 		}
 	}
 	lsof := "/usr/bin/lsof"
@@ -114,6 +93,34 @@ func managedBusy(ctx context.Context, target managedTarget) error {
 		return err
 	}
 	return ctx.Err()
+}
+
+func managedApplicationBusy(ctx context.Context, target managedTarget) error {
+	result, err := managedCommand(ctx, "/bin/ps", []string{"-axo", "pid=,uid=,comm="}, []string{"PATH=/usr/bin:/bin", "LANG=C"}, "/")
+	if err != nil {
+		if managedUncertain(err) {
+			return fmt.Errorf("application process observation: %w", err)
+		}
+		return errors.New("application process observation is unavailable")
+	}
+	for _, line := range strings.Split(result.Stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		uid, err := strconv.ParseUint(fields[1], 10, 32)
+		if err != nil {
+			return errors.New("application process observation is malformed")
+		}
+		if uint32(uid) != target.Identity.UID {
+			continue
+		}
+		name := strings.ToLower(strings.Join(fields[2:], " "))
+		if target.Kind == "chrome" && strings.Contains(name, "google chrome") || target.Kind == "xcode" && (strings.Contains(name, "xcode.app") || strings.HasSuffix(name, "/xcodebuild")) {
+			return errors.New("application consumer is running; preserve this category")
+		}
+	}
+	return nil
 }
 
 func managedLsofProcesses(output string, ownPID int) error {
@@ -310,33 +317,96 @@ func executeManagedPlanWithNative(ctx context.Context, p managedPlan, digest str
 			r.FilesystemAfter = managedFilesystemObservations(devices)
 		}
 	}()
-	persist := func(item managedResult) error {
-		if o.Journal == nil {
-			return nil
-		}
-		if err := json.NewEncoder(o.Journal).Encode(item); err != nil {
-			return fmt.Errorf("write managed journal: %w", err)
-		}
-		if err := o.Journal.Sync(); err != nil {
-			return fmt.Errorf("sync managed journal: %w", err)
-		}
-		return nil
-	}
+	persist := func(item managedResult) error { return persistManagedResult(o.Journal, item) }
 	record := func(item managedResult) error { r.Results = append(r.Results, item); return persist(item) }
 
-	if err := validateManagedPlan(p, o.MandatoryPolicy); err != nil {
+	selected, err := managedExecutionSelection(p, digest, o)
+	if err != nil {
 		return r, err
 	}
+	root, err := openPlainDirectory(p.Root, false)
+	if err != nil {
+		return r, err
+	}
+	defer root.Close()
+	var rootStat unix.Stat_t
+	if err := unix.Fstat(int(root.Fd()), &rootStat); err != nil || !managedDirectoryMatches(rootStat, p.RootIdentity) {
+		return r, errors.New("managed root identity changed")
+	}
+	managedExecutionDevices(devices, p, selected)
+	r.FilesystemBefore = managedFilesystemObservations(devices)
+	if o.Execute {
+		if err := persist(managedResult{Status: "begin", Reason: "managed contract; reviewed plan SHA-256=" + digest}); err != nil {
+			return r, err
+		}
+	}
+	if err := executeManagedTargets(ctx, p.Targets, selected, o, native, &r, persist, record); err != nil {
+		return r, err
+	}
+	return r, nil
+}
+
+func persistManagedResult(journal *os.File, item managedResult) error {
+	if journal == nil {
+		return nil
+	}
+	if err := json.NewEncoder(journal).Encode(item); err != nil {
+		return fmt.Errorf("write managed journal: %w", err)
+	}
+	if err := journal.Sync(); err != nil {
+		return fmt.Errorf("sync managed journal: %w", err)
+	}
+	return nil
+}
+
+func managedExecutionDevices(devices map[uint64]string, p managedPlan, selected map[string]bool) {
+	devices[p.RootIdentity.Device] = p.Root
+	for _, t := range p.Targets {
+		if t.Identity.Inode != 0 && (len(selected) == 0 || selected[t.Path]) {
+			if _, ok := devices[t.Identity.Device]; !ok {
+				devices[t.Identity.Device] = t.Path
+			}
+		}
+	}
+}
+
+func executeManagedTargets(ctx context.Context, targets []managedTarget, selected map[string]bool, o managedExecuteOptions, native managedNativeOps, r *managedExecutionReport, persist, record func(managedResult) error) error {
+	actions := 0
+	failed := false
+	for _, target := range targets {
+		if len(selected) != 0 && !selected[target.Path] {
+			continue
+		}
+		if o.Limit > 0 && actions >= o.Limit {
+			break
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := executeManagedTarget(ctx, target, o, native, r, &actions, &failed, persist, record); err != nil {
+			return err
+		}
+	}
+	if failed {
+		return errors.New("selected managed operations were blocked or partial; inspect the report")
+	}
+	return nil
+}
+
+func managedExecutionSelection(p managedPlan, digest string, o managedExecuteOptions) (map[string]bool, error) {
+	if err := validateManagedPlan(p, o.MandatoryPolicy); err != nil {
+		return nil, err
+	}
 	if o.Limit < 0 {
-		return r, errors.New("limit cannot be negative")
+		return nil, errors.New("limit cannot be negative")
 	}
 	if o.Execute && (len(digest) != 64 || digest != o.ExpectedDigest || len(o.Targets) == 0 || o.Journal == nil) {
-		return r, errors.New("execution requires the exact reviewed SHA-256 and explicit target selections and a private journal")
+		return nil, errors.New("execution requires the exact reviewed SHA-256 and explicit target selections and a private journal")
 	}
 	selected := map[string]bool{}
 	for _, path := range o.Targets {
 		if selected[path] {
-			return r, errors.New("duplicate target selection")
+			return nil, errors.New("duplicate target selection")
 		}
 		selected[path] = true
 	}
@@ -348,212 +418,192 @@ func executeManagedPlanWithNative(ctx context.Context, p managedPlan, digest str
 			}
 		}
 		if !found {
-			return r, errors.New("selected target is absent from the reviewed plan")
+			return nil, errors.New("selected target is absent from the reviewed plan")
 		}
 	}
-	root, err := openPlainDirectory(p.Root, false)
+	return selected, nil
+}
+
+func executeManagedTarget(ctx context.Context, target managedTarget, o managedExecuteOptions, native managedNativeOps, r *managedExecutionReport, actions *int, failed *bool, persist, record func(managedResult) error) error {
+	if target.State != "planned" {
+		if err := record(managedResult{Target: target.Path, Status: target.State, Reason: target.Reason}); err != nil {
+			return err
+		}
+		*failed = *failed || target.State == "blocked"
+		return nil
+	}
+	dir, err := managedOpenTarget(target)
 	if err != nil {
-		return r, err
+		if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
+			return e
+		}
+		*failed = true
+		return nil
 	}
-	defer root.Close()
-	var rootStat unix.Stat_t
-	if err := unix.Fstat(int(root.Fd()), &rootStat); err != nil || !managedDirectoryMatches(rootStat, p.RootIdentity) {
-		return r, errors.New("managed root identity changed")
-	}
-	devices[p.RootIdentity.Device] = p.Root
-	for _, t := range p.Targets {
-		if t.Identity.Inode != 0 && (len(selected) == 0 || selected[t.Path]) {
-			if _, ok := devices[t.Identity.Device]; !ok {
-				devices[t.Identity.Device] = t.Path
-			}
-		}
-	}
-	r.FilesystemBefore = managedFilesystemObservations(devices)
-	if o.Execute {
-		if err := persist(managedResult{Status: "begin", Reason: "managed contract; reviewed plan SHA-256=" + digest}); err != nil {
-			return r, err
-		}
-	}
-	actions := 0
-	failed := false
-	for _, target := range p.Targets {
-		if len(selected) != 0 && !selected[target.Path] {
-			continue
-		}
-		if o.Limit > 0 && actions >= o.Limit {
-			break
-		}
-		if err := ctx.Err(); err != nil {
-			return r, err
-		}
-		if target.State != "planned" {
-			if err := record(managedResult{Target: target.Path, Status: target.State, Reason: target.Reason}); err != nil {
-				return r, err
-			}
-			failed = failed || target.State == "blocked"
-			continue
-		}
-		dir, err := managedOpenTarget(target)
-		if err != nil {
-			if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
-				return r, e
-			}
-			failed = true
-			continue
-		}
-		if !o.Execute {
-			if err := record(managedResult{Target: target.Path, Status: "would_apply", Reason: "dry run; consumer observation and execution remain required"}); err != nil {
-				_ = dir.Close()
-				return r, err
-			}
+	if !o.Execute {
+		if err := record(managedResult{Target: target.Path, Status: "would_apply", Reason: "dry run; consumer observation and execution remain required"}); err != nil {
 			_ = dir.Close()
-			continue
-		}
-		if err := native.busy(ctx, target); err != nil {
-			_ = dir.Close()
-			if managedUncertain(err) {
-				return r, errors.Join(err, record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}))
-			}
-			if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
-				return r, e
-			}
-			failed = true
-			continue
-		}
-		if target.Kind == "go_build" || target.Kind == "npm" {
-			if err := verifyManagedTool(target.Kind, target.Tool); err != nil {
-				_ = dir.Close()
-				failed = true
-				if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
-					return r, e
-				}
-				continue
-			}
-			qualified, err := native.qualify(ctx, target.Kind)
-			if managedUncertain(err) {
-				_ = dir.Close()
-				return r, errors.Join(err, record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}))
-			}
-			if err != nil || !reflect.DeepEqual(qualified, target.Tool) {
-				if err := record(managedResult{Target: target.Path, Status: "blocked", Reason: "native qualification or executable identity differs"}); err != nil {
-					_ = dir.Close()
-					return r, err
-				}
-				_ = dir.Close()
-				failed = true
-				continue
-			}
-			current, err := managedOpenTarget(target)
-			if err != nil {
-				_ = dir.Close()
-				return r, err
-			}
-			_ = current.Close()
-			_, before, measureErr := cacheWalk(ctx, dir, target.Identity.Device, cacheGuardEntry(target.Kind, target.Path))
-			if measureErr != nil {
-				if err := record(managedResult{Target: target.Path, Status: "blocked", Reason: measureErr.Error()}); err != nil {
-					_ = dir.Close()
-					return r, err
-				}
-				_ = dir.Close()
-				failed = true
-				continue
-			}
-			if err := persist(managedResult{Target: target.Path, Status: "intent", Reason: "native manager operation, not a file whitelist"}); err != nil {
-				_ = dir.Close()
-				return r, err
-			}
-			result, runErr := native.run(ctx, target, target.Tool)
-			actions++
-			item := managedResult{Target: target.Path, Status: "native_completed", Command: &result, BeforeFiles: &before}
-			if managedUncertain(runErr) {
-				item.Status = "partial"
-				item.Reason = runErr.Error() + "; changes may be partial"
-				_ = dir.Close()
-				return r, errors.Join(runErr, record(item))
-			}
-			afterDir, afterErr := openPlainDirectory(target.Path, false)
-			var after int64
-			if afterErr == nil {
-				_, after, afterErr = cacheWalk(ctx, afterDir, target.Identity.Device, nil)
-				_ = afterDir.Close()
-			} else if errors.Is(afterErr, os.ErrNotExist) {
-				afterErr = nil
-			}
-			if afterErr == nil {
-				item.AfterFiles = &after
-				if after < before {
-					r.Changed++
-				}
-			}
-			if runErr != nil || afterErr != nil {
-				item.Status = "partial"
-				item.Reason = fmt.Sprintf("native error: %v; post-measurement: %v; changes may be partial", runErr, afterErr)
-				failed = true
-			}
-			if err := record(item); err != nil {
-				_ = dir.Close()
-				return r, err
-			}
-			_ = dir.Close()
-			continue
-		}
-		if _, _, err := cacheWalk(ctx, dir, target.Identity.Device, managedProjectGuard); err != nil {
-			_ = dir.Close()
-			failed = true
-			if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
-				return r, e
-			}
-			continue
-		}
-		for _, entry := range target.Entries {
-			if o.Limit > 0 && actions >= o.Limit {
-				break
-			}
-			actions++
-			if err := ctx.Err(); err != nil {
-				_ = dir.Close()
-				return r, err
-			}
-			current, err := managedOpenTarget(target)
-			if err != nil {
-				_ = dir.Close()
-				return r, err
-			}
-			_ = current.Close()
-			var random [16]byte
-			if _, err := rand.Read(random[:]); err != nil {
-				_ = dir.Close()
-				return r, err
-			}
-			claimName := ".tidyshare-managed-" + hex.EncodeToString(random[:])
-			claimPath := filepath.Join(target.Path, filepath.Dir(entry.Name), claimName, "entry")
-			if err := persist(managedResult{Target: target.Path, Name: entry.Name, Status: "intent", RecoveryPath: claimPath}); err != nil {
-				_ = dir.Close()
-				return r, err
-			}
-			changed, recovery, err := managedRemoveEntry(ctx, dir, entry, claimName)
-			item := managedResult{Target: target.Path, Name: entry.Name, Status: "skipped", RecoveryPath: recovery}
-			if changed {
-				item.Status = "removed"
-				r.Changed++
-			}
-			if err != nil {
-				item.Reason = err.Error()
-				if changed || recovery != "" || !errors.Is(err, errManagedEntryChanged) {
-					item.Status = "partial"
-					failed = true
-				}
-			}
-			if err := record(item); err != nil {
-				_ = dir.Close()
-				return r, err
-			}
+			return err
 		}
 		_ = dir.Close()
+		return nil
 	}
-	if failed {
-		return r, errors.New("selected managed operations were blocked or partial; inspect the report")
+	if err := native.busy(ctx, target); err != nil {
+		_ = dir.Close()
+		if managedUncertain(err) {
+			return errors.Join(err, record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}))
+		}
+		if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
+			return e
+		}
+		*failed = true
+		return nil
 	}
-	return r, nil
+	if target.Kind == "go_build" || target.Kind == "npm" {
+		return executeManagedNative(ctx, target, dir, native, r, actions, failed, persist, record)
+	}
+	return executeManagedManifest(ctx, target, dir, o, r, actions, failed, persist, record)
+}
+
+func executeManagedNative(ctx context.Context, target managedTarget, dir *os.File, native managedNativeOps, r *managedExecutionReport, actions *int, failed *bool, persist, record func(managedResult) error) error {
+	if err := verifyManagedTool(target.Kind, target.Tool); err != nil {
+		_ = dir.Close()
+		*failed = true
+		if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
+			return e
+		}
+		return nil
+	}
+	qualified, err := native.qualify(ctx, target.Kind)
+	if managedUncertain(err) {
+		_ = dir.Close()
+		return errors.Join(err, record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}))
+	}
+	if err != nil || !reflect.DeepEqual(qualified, target.Tool) {
+		if err := record(managedResult{Target: target.Path, Status: "blocked", Reason: "native qualification or executable identity differs"}); err != nil {
+			_ = dir.Close()
+			return err
+		}
+		_ = dir.Close()
+		*failed = true
+		return nil
+	}
+	current, err := managedOpenTarget(target)
+	if err != nil {
+		_ = dir.Close()
+		return err
+	}
+	_ = current.Close()
+	_, before, measureErr := cacheWalk(ctx, dir, target.Identity.Device, cacheGuardEntry(target.Kind, target.Path))
+	if measureErr != nil {
+		if err := record(managedResult{Target: target.Path, Status: "blocked", Reason: measureErr.Error()}); err != nil {
+			_ = dir.Close()
+			return err
+		}
+		_ = dir.Close()
+		*failed = true
+		return nil
+	}
+	if err := persist(managedResult{Target: target.Path, Status: "intent", Reason: "native manager operation, not a file whitelist"}); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	result, runErr := native.run(ctx, target, target.Tool)
+	*actions++
+	item := managedResult{Target: target.Path, Status: "native_completed", Command: &result, BeforeFiles: &before}
+	if managedUncertain(runErr) {
+		item.Status = "partial"
+		item.Reason = runErr.Error() + "; changes may be partial"
+		_ = dir.Close()
+		return errors.Join(runErr, record(item))
+	}
+	afterDir, afterErr := openPlainDirectory(target.Path, false)
+	var after int64
+	if afterErr == nil {
+		_, after, afterErr = cacheWalk(ctx, afterDir, target.Identity.Device, nil)
+		_ = afterDir.Close()
+	} else if errors.Is(afterErr, os.ErrNotExist) {
+		afterErr = nil
+	}
+	if afterErr == nil {
+		item.AfterFiles = &after
+		if after < before {
+			r.Changed++
+		}
+	}
+	if runErr != nil || afterErr != nil {
+		item.Status = "partial"
+		item.Reason = fmt.Sprintf("native error: %v; post-measurement: %v; changes may be partial", runErr, afterErr)
+		*failed = true
+	}
+	if err := record(item); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	_ = dir.Close()
+	return nil
+}
+
+func executeManagedManifest(ctx context.Context, target managedTarget, dir *os.File, o managedExecuteOptions, r *managedExecutionReport, actions *int, failed *bool, persist, record func(managedResult) error) error {
+	if _, _, err := cacheWalk(ctx, dir, target.Identity.Device, managedProjectGuard); err != nil {
+		_ = dir.Close()
+		*failed = true
+		if e := record(managedResult{Target: target.Path, Status: "blocked", Reason: err.Error()}); e != nil {
+			return e
+		}
+		return nil
+	}
+	for _, entry := range target.Entries {
+		if o.Limit > 0 && *actions >= o.Limit {
+			break
+		}
+		*actions++
+		if err := executeManagedEntry(ctx, target, dir, entry, r, failed, persist, record); err != nil {
+			return err
+		}
+	}
+	_ = dir.Close()
+	return nil
+}
+
+func executeManagedEntry(ctx context.Context, target managedTarget, dir *os.File, entry managedEntry, r *managedExecutionReport, failed *bool, persist, record func(managedResult) error) error {
+	if err := ctx.Err(); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	current, err := managedOpenTarget(target)
+	if err != nil {
+		_ = dir.Close()
+		return err
+	}
+	_ = current.Close()
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	claimName := ".tidyshare-managed-" + hex.EncodeToString(random[:])
+	claimPath := filepath.Join(target.Path, filepath.Dir(entry.Name), claimName, "entry")
+	if err := persist(managedResult{Target: target.Path, Name: entry.Name, Status: "intent", RecoveryPath: claimPath}); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	changed, recovery, err := managedRemoveEntry(ctx, dir, entry, claimName)
+	item := managedResult{Target: target.Path, Name: entry.Name, Status: "skipped", RecoveryPath: recovery}
+	if changed {
+		item.Status = "removed"
+		r.Changed++
+	}
+	if err != nil {
+		item.Reason = err.Error()
+		if changed || recovery != "" || !errors.Is(err, errManagedEntryChanged) {
+			item.Status = "partial"
+			*failed = true
+		}
+	}
+	if err := record(item); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	return nil
 }
