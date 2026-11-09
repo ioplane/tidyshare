@@ -237,6 +237,20 @@ func TestSnapshotPreservesFullNumericSourceSHA(t *testing.T) {
 	}
 }
 
+func TestBundleArchiveRemainsPrivate(t *testing.T) {
+	archive, err := buildBundle(bundleSource(t), t.TempDir(), "0.1.0", fixtureCommit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("release staging archive is accessible to other users: %o", info.Mode().Perm())
+	}
+}
+
 func TestBundleDeterministicAndVersionMatched(t *testing.T) {
 	source := bundleSource(t)
 	first, err := buildBundle(source, t.TempDir(), "0.1.0", fixtureCommit)

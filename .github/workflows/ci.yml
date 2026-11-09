@@ -65,6 +65,11 @@ jobs:
       - name: Test
         run: sudo podman compose run --rm test
 
+      - name: Test agent bundle packaging
+        run: >-
+          sudo podman compose run --rm test
+          go test -count=1 scripts/agent_bundle.go scripts/agent_bundle_test.go
+
       - name: Test with race detector
         run: sudo podman compose run --rm race
 
@@ -104,6 +109,7 @@ jobs:
         run: |
           go vet ./...
           go test -race -count=1 -shuffle=on -timeout=3m ./...
+          go test -count=1 scripts/agent_bundle.go scripts/agent_bundle_test.go
       - name: Build native binary
         env:
           TIDYSHARE_ARCH: ${{ matrix.arch }}

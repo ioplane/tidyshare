@@ -191,9 +191,6 @@ func buildBundle(source, out, version, commit string) (string, error) {
 	if writeErr != nil {
 		return "", writeErr
 	}
-	if err := os.Chmod(file.Name(), 0o644); err != nil {
-		return "", err
-	}
 	destination := filepath.Join(out, "tidyshare_v"+version+"_agent-bundle.tar.gz")
 	if err := os.Rename(file.Name(), destination); err != nil {
 		return "", err

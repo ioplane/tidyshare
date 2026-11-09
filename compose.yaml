@@ -4,6 +4,7 @@ name: tidyshare
 x-verification-service: &verification-service
   image: localhost/ioplane/tidyshare-dev:1.27.3
   working_dir: /workspace
+  init: true
   read_only: true
   network_mode: none
   security_opt:
