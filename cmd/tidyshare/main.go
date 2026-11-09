@@ -165,8 +165,8 @@ func runScan(args []string) int {
 }
 
 func runScanContext(ctx context.Context, args []string) int {
-	o, err := parseScanOptions(args)
-	if err != nil {
+	var o opts
+	if err := parseScanOptions(args, &o); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
@@ -986,8 +986,7 @@ func writeSummaryTable(w io.Writer, title string, m map[string]*agg, n int) {
 	fmt.Fprintln(w)
 }
 
-func parseScanOptions(args []string) (opts, error) {
-	var o opts
+func parseScanOptions(args []string, o *opts) error {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	profile, protected := policyFlags(fs)
 	skip := fs.String("skip", "", "comma-separated absolute dirs to skip")
@@ -1009,35 +1008,35 @@ func parseScanOptions(args []string) (opts, error) {
 	fs.StringVar(&o.yaraCats, "yara-cats", "binary,installer,package,firmware,dump", "categories to scan with YARA")
 	fs.Int64Var(&o.yaraMax, "yara-max-size", 512<<20, "skip larger files in the YARA scan")
 	if err := fs.Parse(args); err != nil {
-		return o, err
+		return err
 	}
 	if o.root == "" {
-		return o, errors.New("-root is required")
+		return errors.New("-root is required")
 	}
 	if o.workers <= 0 || o.minSize <= 0 || o.settle < 0 || o.staleDays < 0 || o.depth < 0 || fs.NArg() != 0 {
-		return o, errors.New("workers and min-size must be positive; settle, stale-days and depth must be non-negative; no positional arguments")
+		return errors.New("workers and min-size must be positive; settle, stale-days and depth must be non-negative; no positional arguments")
 	}
 	if *engine != "podman" && *engine != "docker" {
-		return o, errors.New("-engine must be podman or docker")
+		return errors.New("-engine must be podman or docker")
 	}
 	o.engine = *engine
 	var err error
 	o.policy, err = newStoragePolicy(*profile, *protected)
 	if err != nil {
-		return o, err
+		return err
 	}
 	o.formats, err = parseReportFormats(*formats)
 	if err != nil {
-		return o, err
+		return err
 	}
 	o.imageSockets, err = parseImageSockets(*imageSockets, o.imageUsers)
 	if err != nil {
-		return o, err
+		return err
 	}
-	if err := prepareScanPaths(&o, *skip); err != nil {
-		return o, err
+	if err := prepareScanPaths(o, *skip); err != nil {
+		return err
 	}
-	return o, nil
+	return nil
 }
 
 func skipScanEntry(o opts, p string, d fs.DirEntry, err error) (bool, error) {
