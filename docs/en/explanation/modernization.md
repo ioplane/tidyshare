@@ -41,20 +41,22 @@ Govulncheck1.9.0 returned GO-2026-5932 for x/crypto v0.58.0 as a module-only tra
 
 The review listed 60 SonarCloud findings, including 41 cognitive complexity findings. The fixes retain the CLI/MCP schemas, exit codes and execution gates.
 
-- Verification containers use an init process to reap orphaned descendants. The process owner still requires proof that its group stopped.
+- Verification containers use an init process to reap orphaned descendants. The process owner still requires proof that its group stopped. The default user is `nobody:nogroup`. Only the formatter and the explicit root-owned inventory fixture tests use root.
 - Release staging archives retain private permissions. Archive members retain the existing metadata and manifest contract.
-- The flagged functions split collection, validation, execution and reporting into separate steps.
-- PR CI explicitly runs the standalone bundle tests on Linux and both Darwin architectures.
+- The flagged functions split collection, validation, execution and reporting into separate steps. A local execution state retains the common action limit and journal callbacks without long parameter lists.
+- PR CI explicitly runs the standalone bundle tests on Linux and both Darwin architectures. The formatting gate also retains formatter errors. Checks with invalid syntax and unformatted code fail, while formatted code passes.
 - Both container stages retain the original image digest. Repeated literals and the reported style issues use the existing code conventions.
 - Scan flags fill caller-owned options. This resolves two G702 findings introduced by the extracted configuration return value. Executable selection and separate argv remain unchanged.
 - `github.com/klauspost/compress` changes from `v1.19.1` to `v1.20.2` for [GO-2026-6865](https://pkg.go.dev/vuln/GO-2026-6865).
 
-Local qualification uses source [`80635d4`](https://github.com/ioplane/tidyshare/commit/80635d434b4987f621bce57a11d79312acd35992).
+Local qualification uses source [`0d50c8c`](https://github.com/ioplane/tidyshare/commit/0d50c8c4b845366a827c8bafbc8ca48f20c13119).
 
 | Context | PASS | SKIP | FAIL | Qualification |
 | --- | ---: | ---: | ---: | --- |
 | macOS ARM64 | 335 | 9 | 0 | Native race/shuffle/coverage |
-| Linux ARM64 on OrbStack | 433 | 13 | 0 | Compose race/shuffle/coverage with init |
+| Linux ARM64 on OrbStack | 431 | 13 | 0 | Compose race/shuffle/coverage with init, as nobody |
+| Linux root-owned inventory fixtures | 10 | 0 | 0 | Explicit root lane restores privileged test coverage |
+| Linux standalone bundle tests | 40 | 0 | 0 | Runs as nobody |
 
 Counts include parent/subtest outcomes. Skips remain gaps. Actual CLI/SDK stdio-MCP checks passed with ten new inputs per platform. The server refused execution without startup opt-in. The synthetic sentinel remained intact. Actual OrbStack inventory also completed in read-only mode.
 
@@ -62,7 +64,7 @@ Uncapped gocognit checks covered 41 listed functions and 126 new function declar
 
 Snapshot, tag and prerelease scenarios passed with four binaries, the bundle, receipts and common checksums. Repeated bundles had identical bytes. Local native receipts cover Darwin ARM64 and Linux ARM64. Local AMD64 receipts establish builds only.
 
-The independent review found one lint regression. Scoped re-review checked the fixes for lint, complexity and the dependency. It found no new Critical or Important findings.
+The independent reviews found a lint regression and the formatting gate error. Scoped re-review checked the fixes for lint, complexity, the dependency, execution state, container permissions and formatting. It found no new Critical or Important findings.
 
 Govulncheck 1.9.0 completed a symbol scan with database timestamp 2026-11-05T23:49:57Z. No package/function findings remained. Four module-only findings remain, without call traces. This does not establish a general security clearance.
 
