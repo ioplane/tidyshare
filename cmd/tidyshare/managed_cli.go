@@ -54,7 +54,7 @@ func readManagedPlanData(path string) (managedPlan, []byte, error) {
 	if err := decoder.Decode(&p); err != nil {
 		return p, nil, err
 	}
-	if err := decoder.Decode(new(any)); err != io.EOF {
+	if decoder.Decode(new(any)) != io.EOF {
 		return p, nil, errors.New("managed plan contains trailing data")
 	}
 	if err := validateManagedPlan(p, storagePolicy{}); err != nil {

@@ -686,16 +686,21 @@ func printBundleLinkerFlags(version, commit string, conflict bool) error {
 	return nil
 }
 
-func recordBundleOperation(binary, receipt, version, commit, ldflags, metadata string, native, conflict bool) error {
-	if conflict || receipt == "" {
+type bundleRecordOptions struct {
+	metadata         string
+	native, conflict bool
+}
+
+func recordBundleOperation(binary, receipt, version, commit, ldflags string, o bundleRecordOptions) error {
+	if o.conflict || receipt == "" {
 		return errors.New("select one operation and provide a receipt path")
 	}
-	if metadata != "" {
-		if err := verifyGoReleaserMetadata(metadata, version, commit); err != nil {
+	if o.metadata != "" {
+		if err := verifyGoReleaserMetadata(o.metadata, version, commit); err != nil {
 			return err
 		}
 	}
-	return recordBinaryReceipt(binary, receipt, version, commit, ldflags, native)
+	return recordBinaryReceipt(binary, receipt, version, commit, ldflags, o.native)
 }
 
 func printBundleVersion(refType, ref, commit string, conflict bool) error {
@@ -739,7 +744,7 @@ func run() error {
 		return printBundleVersion(*refType, *ref, *commit, *verify != "" || *assets != "" || *record != "")
 	}
 	if *record != "" {
-		return recordBundleOperation(*record, *receipt, *version, *commit, *ldflags, *metadata, *native, *verify != "" || *assets != "")
+		return recordBundleOperation(*record, *receipt, *version, *commit, *ldflags, bundleRecordOptions{metadata: *metadata, native: *native, conflict: *verify != "" || *assets != ""})
 	}
 	if *native || *receipt != "" || *ldflags != "" || *metadata != "" {
 		return errors.New("binary receipt options require record-binary")

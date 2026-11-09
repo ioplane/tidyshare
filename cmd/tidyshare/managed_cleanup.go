@@ -276,7 +276,6 @@ func planManagedTarget(ctx context.Context, p *managedPlan, kind, path string, r
 }
 
 func planManagedManifest(ctx context.Context, dir *os.File, st unix.Stat_t, createdAt time.Time, path string, target *managedTarget, remaining *int) error {
-
 	cutoff := createdAt.Add(-24 * time.Hour)
 	_, _, err := cacheWalk(ctx, dir, uint64(st.Dev), func(parent *os.File, name string, s unix.Stat_t) error {
 		if err := managedProjectGuard(parent, name, s); err != nil {
