@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -37,14 +39,86 @@ func ancestors(p, root string, f func(d string)) {
 	}
 }
 
-func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error {
+func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) (resultErr error) {
 	cut := time.Now().AddDate(0, 0, -o.staleDays).Unix()
+	dup := candidateDuplicatePaths(groups)
+	archCovered := candidateCoveredArchives(ir)
+	dirs := candidateDirectoryStats(es, dup, o.root)
+	// top-most directories only: skip a dir when an ancestor already qualifies
+	topmost := func(ok func(string, *dstat) bool) []string { return topmostCandidateDirectories(dirs, o.root, ok) }
+	redundant := topmost(func(_ string, s *dstat) bool { return s.files > 0 && s.dupFiles == s.files })
+	regenDirs := topmost(func(d string, _ *dstat) bool { return regen[filepath.Base(d)] > 0 })
+	coldDirs := topmost(func(_ string, s *dstat) bool { return s.newest < cut && s.bytes >= 100<<20 })
+
+	tierBytes, tierFiles := candidateTierCounts(es, dup, archCovered, regenDirs, o.root)
+	byDir, dkeys := candidateDuplicateDirectories(groups, o.root)
+	tsv, err := os.Create(filepath.Join(o.out, "candidates.tsv"))
+	if err != nil {
+		return err
+	}
+	tw := bufio.NewWriter(tsv)
+	fmt.Fprintln(tw, "tier\tkind\tbytes\tfiles\tpath\tnote")
+	row := func(t int, kind string, b, n int64, p, note string) {
+		fmt.Fprintf(tw, "%d\t%s\t%d\t%d\t%s\t%s\n", t, kind, b, n, strconv.Quote(p), strconv.Quote(note))
+	}
+	writeCandidateDuplicateRows(row, es, groups)
+	for _, d := range redundant {
+		row(1, "redundant-dir", dirs[d].bytes, dirs[d].files, d, "every file is a duplicate of a kept copy")
+	}
+	writeCandidateArchiveRows(row, ir)
+	for _, d := range regenDirs {
+		row(regen[filepath.Base(d)], "regen-dir", dirs[d].bytes, dirs[d].files, d, filepath.Base(d))
+	}
+	for _, d := range coldDirs {
+		row(3, "cold-dir", dirs[d].bytes, dirs[d].files, d, "newest mtime "+time.Unix(dirs[d].newest, 0).UTC().Format("2006-01-02"))
+	}
+	if err := finishReport(tw, tsv); err != nil {
+		return err
+	}
+
+	md, err := os.Create(filepath.Join(o.out, "candidates.md"))
+	if err != nil {
+		return err
+	}
+	w := bufio.NewWriter(md)
+	defer func() { resultErr = errors.Join(resultErr, finishReport(w, md)) }()
+	fmt.Fprintf(w, "# Deletion candidates for %s\n\nThis scan does not delete data. Each file is counted once, in its lowest tier.\n\n| tier | meaning | files | size |\n|:---|:---|---:|---:|\n", markdownCell(o.root))
+	for t := 1; t <= 3; t++ {
+		fmt.Fprintf(w, "| %d | %s | %d | %s |\n", t, []string{"", "safe: duplicate copy, junk", "review: image archive in storage, cache", fmt.Sprintf("decide: untouched %d d, regenerable output", o.staleDays)}[t], tierFiles[t], gib(tierBytes[t]))
+	}
+	list := func(title string, paths []string, n int, note func(string) string) {
+		writeCandidateDirectoryTable(w, dirs, title, paths, n, note)
+	}
+	list("Tier 1: directories whose every file is a duplicate", redundant, 50, func(string) string { return "" })
+	writeCandidateDuplicateTables(w, byDir, dkeys, groups)
+	writeCandidateArchiveTable(w, ir)
+	var r2, r3 []string
+	for _, d := range regenDirs {
+		if regen[filepath.Base(d)] == 2 {
+			r2 = append(r2, d)
+		} else {
+			r3 = append(r3, d)
+		}
+	}
+	list("Tier 2: regenerable caches (node_modules, __pycache__, .venv, ...)", r2, 30, func(d string) string { return filepath.Base(d) })
+	list("Tier 3: regenerable build output (target, build, dist, extracted, ...)", r3, 40, func(d string) string { return filepath.Base(d) })
+	list(fmt.Sprintf("Tier 3: top-most trees with nothing modified in %d d (>= 100 MiB)", o.staleDays), coldDirs, 50,
+		func(d string) string { return "newest " + time.Unix(dirs[d].newest, 0).UTC().Format("2006-01-02") })
+	return nil
+}
+
+func candidateDuplicatePaths(groups [][]entry) map[string]bool {
 	dup := map[string]bool{}
 	for _, g := range groups {
 		for _, e := range g[1:] {
 			dup[e.Path] = true
 		}
 	}
+
+	return dup
+}
+
+func candidateCoveredArchives(ir imageReport) map[string]bool {
 	archCovered := map[string]bool{}
 	for _, a := range ir.Archives {
 		if a.Status == "in-store" {
@@ -52,10 +126,14 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 		}
 	}
 
+	return archCovered
+}
+
+func candidateDirectoryStats(es []entry, dup map[string]bool, root string) map[string]*dstat {
 	dirs := map[string]*dstat{}
 	for _, e := range es {
 		d := dup[e.Path]
-		ancestors(e.Path, o.root, func(dir string) {
+		ancestors(e.Path, root, func(dir string) {
 			s := dirs[dir]
 			if s == nil {
 				s = &dstat{}
@@ -70,33 +148,33 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 			}
 		})
 	}
-	// top-most directories only: skip a dir when an ancestor already qualifies
-	topmost := func(ok func(d string, s *dstat) bool) []string {
-		var sel []string
-		for d, s := range dirs {
-			if ok(d, s) {
-				sel = append(sel, d)
-			}
-		}
-		set := map[string]bool{}
-		for _, d := range sel {
-			set[d] = true
-		}
-		var out []string
-		for _, d := range sel {
-			nested := false
-			ancestors(d, o.root, func(a string) { nested = nested || set[a] })
-			if !nested {
-				out = append(out, d)
-			}
-		}
-		sort.Slice(out, func(i, j int) bool { return dirs[out[i]].bytes > dirs[out[j]].bytes })
-		return out
-	}
-	redundant := topmost(func(_ string, s *dstat) bool { return s.files > 0 && s.dupFiles == s.files })
-	regenDirs := topmost(func(d string, _ *dstat) bool { return regen[filepath.Base(d)] > 0 })
-	coldDirs := topmost(func(_ string, s *dstat) bool { return s.newest < cut && s.bytes >= 100<<20 })
+	return dirs
+}
 
+func topmostCandidateDirectories(dirs map[string]*dstat, root string, ok func(string, *dstat) bool) []string {
+	var sel []string
+	for d, s := range dirs {
+		if ok(d, s) {
+			sel = append(sel, d)
+		}
+	}
+	set := map[string]bool{}
+	for _, d := range sel {
+		set[d] = true
+	}
+	var out []string
+	for _, d := range sel {
+		nested := false
+		ancestors(d, root, func(a string) { nested = nested || set[a] })
+		if !nested {
+			out = append(out, d)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return dirs[out[i]].bytes > dirs[out[j]].bytes })
+	return out
+}
+
+func candidateTierCounts(es []entry, dup, archCovered map[string]bool, regenDirs []string, root string) ([4]int64, [4]int64) {
 	// per-file tier (lowest wins) so the summary does not double count
 	regenSet := map[string]bool{}
 	for _, d := range regenDirs {
@@ -104,34 +182,22 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 	}
 	var tierBytes, tierFiles [4]int64
 	for _, e := range es {
-		t := 0
-		if dup[e.Path] || e.Stale == "junk" {
-			t = 1
-		} else {
-			inRegen := 0
-			ancestors(e.Path, o.root, func(a string) {
-				if regenSet[a] {
-					inRegen = regen[filepath.Base(a)]
-				}
-			})
-			switch {
-			case archCovered[e.Path] || inRegen == 2:
-				t = 2
-			case inRegen == 3 || e.Stale == "cold":
-				t = 3
-			}
-		}
+		t := candidateFileTier(e, dup[e.Path], archCovered[e.Path], regenSet, root)
 		if t > 0 {
 			tierBytes[t] += e.Size
 			tierFiles[t]++
 		}
 	}
 
+	return tierBytes, tierFiles
+}
+
+func candidateDuplicateDirectories(groups [][]entry, root string) (map[string]*dstat, []string) {
 	// dup bytes per directory at depth <= 4 (what to look at first)
 	byDir := map[string]*dstat{}
 	for _, g := range groups {
 		for _, e := range g[1:] {
-			rel := strings.TrimPrefix(e.Path, o.root+"/")
+			rel := strings.TrimPrefix(e.Path, root+"/")
 			parts := strings.Split(rel, "/")
 			n := min(len(parts)-1, 4)
 			k := strings.Join(parts[:n], "/")
@@ -148,15 +214,10 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 	}
 	sort.Slice(dkeys, func(i, j int) bool { return byDir[dkeys[i]].dupBytes > byDir[dkeys[j]].dupBytes })
 
-	tsv, err := os.Create(filepath.Join(o.out, "candidates.tsv"))
-	if err != nil {
-		return err
-	}
-	tw := bufio.NewWriter(tsv)
-	fmt.Fprintln(tw, "tier\tkind\tbytes\tfiles\tpath\tnote")
-	row := func(t int, kind string, b, n int64, p, note string) {
-		fmt.Fprintf(tw, "%d\t%s\t%d\t%d\t%s\t%s\n", t, kind, b, n, strconv.Quote(p), strconv.Quote(note))
-	}
+	return byDir, dkeys
+}
+
+func writeCandidateDuplicateRows(row func(int, string, int64, int64, string, string), es []entry, groups [][]entry) {
 	for _, g := range groups {
 		for _, e := range g[1:] {
 			row(1, "dup-file", e.Size, 1, e.Path, "keep: "+g[0].Path)
@@ -167,48 +228,17 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 			row(1, "junk-file", e.Size, 1, e.Path, "")
 		}
 	}
-	for _, d := range redundant {
-		row(1, "redundant-dir", dirs[d].bytes, dirs[d].files, d, "every file is a duplicate of a kept copy")
-	}
+}
+
+func writeCandidateArchiveRows(row func(int, string, int64, int64, string, string), ir imageReport) {
 	for _, a := range ir.Archives {
 		if a.Status == "in-store" {
 			row(2, "image-archive", a.Size, 1, a.Path, "images present in "+strings.Join(a.Stores, ","))
 		}
 	}
-	for _, d := range regenDirs {
-		row(regen[filepath.Base(d)], "regen-dir", dirs[d].bytes, dirs[d].files, d, filepath.Base(d))
-	}
-	for _, d := range coldDirs {
-		row(3, "cold-dir", dirs[d].bytes, dirs[d].files, d, "newest mtime "+time.Unix(dirs[d].newest, 0).UTC().Format("2006-01-02"))
-	}
-	if err := tw.Flush(); err != nil {
-		return err
-	}
-	if err := tsv.Close(); err != nil {
-		return err
-	}
+}
 
-	md, err := os.Create(filepath.Join(o.out, "candidates.md"))
-	if err != nil {
-		return err
-	}
-	defer md.Close()
-	w := bufio.NewWriter(md)
-	defer w.Flush()
-	fmt.Fprintf(w, "# Deletion candidates for %s\n\nThis scan does not delete data. Each file is counted once, in its lowest tier.\n\n| tier | meaning | files | size |\n|:---|:---|---:|---:|\n", markdownCell(o.root))
-	for t := 1; t <= 3; t++ {
-		fmt.Fprintf(w, "| %d | %s | %d | %s |\n", t, []string{"", "safe: duplicate copy, junk", "review: image archive in storage, cache", fmt.Sprintf("decide: untouched %d d, regenerable output", o.staleDays)}[t], tierFiles[t], gib(tierBytes[t]))
-	}
-	list := func(title string, paths []string, n int, note func(string) string) {
-		fmt.Fprintf(w, "\n## %s\n\n| size | files | path | note |\n|---:|---:|:---|:---|\n", title)
-		for i, d := range paths {
-			if i == n {
-				break
-			}
-			fmt.Fprintf(w, "| %s | %d | %s | %s |\n", gib(dirs[d].bytes), dirs[d].files, markdownCell(d), markdownCell(note(d)))
-		}
-	}
-	list("Tier 1: directories whose every file is a duplicate", redundant, 50, func(string) string { return "" })
+func writeCandidateDuplicateTables(w io.Writer, byDir map[string]*dstat, dkeys []string, groups [][]entry) {
 	fmt.Fprint(w, "\n## Tier 1: duplicate bytes per directory (depth <= 4)\n\n| reclaimable | dup files | directory |\n|---:|---:|:---|\n")
 	for i, k := range dkeys {
 		if i == 50 {
@@ -226,23 +256,44 @@ func writeCandidates(es []entry, groups [][]entry, ir imageReport, o opts) error
 			fmt.Fprintf(w, "| %s | %s | %s |\n", gib(e.Size), markdownCell(e.Path), markdownCell(g[0].Path))
 		}
 	}
+}
+
+func writeCandidateDirectoryTable(w io.Writer, dirs map[string]*dstat, title string, paths []string, n int, note func(string) string) {
+	fmt.Fprintf(w, "\n## %s\n\n| size | files | path | note |\n|---:|---:|:---|:---|\n", title)
+	for i, d := range paths {
+		if i == n {
+			break
+		}
+		fmt.Fprintf(w, "| %s | %d | %s | %s |\n", gib(dirs[d].bytes), dirs[d].files, markdownCell(d), markdownCell(note(d)))
+	}
+}
+
+func writeCandidateArchiveTable(w io.Writer, ir imageReport) {
 	fmt.Fprint(w, "\n## Tier 2: image archives already in container storage\n\n| size | path | stores | tags |\n|---:|:---|:---|:---|\n")
 	for _, a := range ir.Archives {
 		if a.Status == "in-store" {
 			fmt.Fprintf(w, "| %s | %s | %s | %s |\n", gib(a.Size), markdownCell(a.Path), markdownCell(strings.Join(a.Stores, ",")), markdownCell(strings.Join(a.Tags, " ")))
 		}
 	}
-	var r2, r3 []string
-	for _, d := range regenDirs {
-		if regen[filepath.Base(d)] == 2 {
-			r2 = append(r2, d)
-		} else {
-			r3 = append(r3, d)
+}
+
+func candidateFileTier(e entry, duplicate, archived bool, regenSet map[string]bool, root string) int {
+	t := 0
+	if duplicate || e.Stale == "junk" {
+		t = 1
+	} else {
+		inRegen := 0
+		ancestors(e.Path, root, func(a string) {
+			if regenSet[a] {
+				inRegen = regen[filepath.Base(a)]
+			}
+		})
+		switch {
+		case archived || inRegen == 2:
+			t = 2
+		case inRegen == 3 || e.Stale == "cold":
+			t = 3
 		}
 	}
-	list("Tier 2: regenerable caches (node_modules, __pycache__, .venv, ...)", r2, 30, func(d string) string { return filepath.Base(d) })
-	list("Tier 3: regenerable build output (target, build, dist, extracted, ...)", r3, 40, func(d string) string { return filepath.Base(d) })
-	list(fmt.Sprintf("Tier 3: top-most trees with nothing modified in %d d (>= 100 MiB)", o.staleDays), coldDirs, 50,
-		func(d string) string { return "newest " + time.Unix(dirs[d].newest, 0).UTC().Format("2006-01-02") })
-	return nil
+	return t
 }

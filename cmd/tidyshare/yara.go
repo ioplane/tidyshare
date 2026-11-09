@@ -2,7 +2,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,12 +20,33 @@ type yaraHit struct {
 	Size       int64
 }
 
-// runYara scans selected categories with the configured classic yara CLI.
-func runYara(es []entry, o opts) ([]yaraHit, error) {
-	if o.yaraRules == "" {
-		return nil, nil
+type yaraDiagnosticWriter struct {
+	io.Writer
+	cancel context.CancelFunc
+}
+
+func (w *yaraDiagnosticWriter) Write(data []byte) (int, error) {
+	n, err := w.Writer.Write(data)
+	if n < len(data) && err == nil {
+		err = io.ErrShortWrite
 	}
-	rules, err := rulesFile(o)
+	if err != nil {
+		w.cancel()
+	}
+	return n, err
+}
+
+// runYara scans selected categories with the configured classic yara CLI.
+func runYara(ctx context.Context, es []entry, o opts) (hits []yaraHit, resultErr error) {
+	if o.yaraRules == "" {
+		return nil, ctx.Err()
+	}
+	defer func() {
+		if managedUncertain(resultErr) {
+			resultErr = retainManagedRoot(resultErr, o.out)
+		}
+	}()
+	rules, err := rulesFile(ctx, o)
 	if err != nil {
 		return nil, err
 	}
@@ -41,45 +66,53 @@ func runYara(es []entry, o opts) ([]yaraHit, error) {
 			sizes[e.Path] = e.Size
 		}
 	}
-	if err := w.Flush(); err != nil {
-		return nil, err
-	}
-	if err := lf.Close(); err != nil {
+	if err := finishReport(w, lf); err != nil {
 		return nil, err
 	}
 	fmt.Fprintf(os.Stderr, "yara: scanning %d files\n", len(sizes))
 
-	errf, _ := os.Create(filepath.Join(o.out, "yara.err"))
-	defer errf.Close()
-	c := exec.Command(o.yaraBin, "-w", "-f", "-p", strconv.Itoa(o.workers), "-a", "120",
-		"--scan-list", rules, lf.Name())
-	c.Stderr = errf
-	out, err := c.StdoutPipe()
+	errf, err := os.Create(filepath.Join(o.out, "yara.err"))
 	if err != nil {
 		return nil, err
 	}
-	if err := c.Start(); err != nil {
-		return nil, err
-	}
-	var hits []yaraHit
-	sc := bufio.NewScanner(out)
-	sc.Buffer(make([]byte, 1<<20), 1<<20)
-	for sc.Scan() {
-		rule, path, ok := strings.Cut(sc.Text(), " ") // rule names contain no spaces
-		if ok {
-			hits = append(hits, yaraHit{rule, path, sizes[path]})
+	defer func() { resultErr = errors.Join(resultErr, errf.Close()) }()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c := exec.Command(o.yaraBin, "-w", "-f", "-p", strconv.Itoa(o.workers), "-a", "120",
+		"--scan-list", rules, lf.Name())
+	c.Stderr = &yaraDiagnosticWriter{errf, cancel}
+	reader, writer := io.Pipe()
+	c.Stdout = writer
+	scanned := make(chan error, 1)
+	go func() {
+		sc := bufio.NewScanner(reader)
+		sc.Buffer(make([]byte, 4096), 1<<20)
+		for sc.Scan() {
+			rule, path, ok := strings.Cut(sc.Text(), " ")
+			if ok {
+				hits = append(hits, yaraHit{rule, path, sizes[path]})
+			}
 		}
+		err := sc.Err()
+		_ = reader.CloseWithError(err)
+		if err != nil {
+			cancel()
+		}
+		scanned <- err
+	}()
+	_, runErr := runOwnedCommand(ctx, c, managedProcessOps{})
+	_ = writer.Close()
+	scanErr := <-scanned
+	writeErr := writeYara(hits, o)
+	if err := errors.Join(runErr, scanErr, writeErr); err != nil {
+		return hits, fmt.Errorf("YARA stage failed (see yara.err): %w", err)
 	}
-	// yara exits non-zero on unreadable files; hits already collected stay valid
-	if err := c.Wait(); err != nil && len(hits) == 0 {
-		return nil, fmt.Errorf("%s: %w (see yara.err)", o.yaraBin, err)
-	}
-	return hits, writeYara(hits, o)
+	return hits, nil
 }
 
 // rulesFile returns the rules path; a directory becomes a generated index of
 // include lines (classic yara takes one rules file).
-func rulesFile(o opts) (string, error) {
+func rulesFile(ctx context.Context, o opts) (path string, resultErr error) {
 	st, err := os.Stat(o.yaraRules)
 	if err != nil {
 		return "", err
@@ -92,7 +125,7 @@ func rulesFile(o opts) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
+	defer func() { resultErr = errors.Join(resultErr, f.Close()) }()
 	// accept a file only if it compiles together with the ones accepted so far
 	// (the rule sets overlap: duplicated identifiers, dialect-specific syntax)
 	var accepted []string
@@ -100,19 +133,31 @@ func rulesFile(o opts) (string, error) {
 		if err != nil || d.IsDir() || (!strings.HasSuffix(p, ".yar") && !strings.HasSuffix(p, ".yara")) {
 			return err
 		}
-		abs, _ := filepath.Abs(p)
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return err
+		}
 		try := filepath.Join(o.out, "yara-try.yar")
-		if werr := os.WriteFile(try, []byte(includes(append(accepted, abs))), 0o644); werr != nil {
+		if werr := os.WriteFile(try, []byte(includes(append(accepted, abs))), 0o600); werr != nil {
 			return werr
 		}
-		if out, e := exec.Command(o.yaraBin, "-w", try, os.DevNull).CombinedOutput(); e != nil {
-			fmt.Fprintf(os.Stderr, "warn: yara rules skipped: %s: %s\n", abs, firstLine(out))
+		var output bytes.Buffer
+		command := exec.Command(o.yaraBin, "-w", try, os.DevNull)
+		command.Stdout = &output
+		command.Stderr = &output
+		if _, e := runOwnedCommand(ctx, command, managedProcessOps{}); e != nil {
+			if managedUncertain(e) || ctx.Err() != nil {
+				return e
+			}
+			fmt.Fprintf(os.Stderr, "warn: yara rules skipped: %s: %s\n", abs, firstLine(output.Bytes()))
 			return nil
 		}
 		accepted = append(accepted, abs)
 		return nil
 	})
-	_ = os.Remove(filepath.Join(o.out, "yara-try.yar"))
+	if !managedUncertain(err) {
+		_ = os.Remove(filepath.Join(o.out, "yara-try.yar"))
+	}
 	if err != nil {
 		return "", err
 	}
@@ -120,14 +165,13 @@ func rulesFile(o opts) (string, error) {
 	return idx, err
 }
 
-func writeYara(hits []yaraHit, o opts) error {
+func writeYara(hits []yaraHit, o opts) (resultErr error) {
 	f, err := os.Create(filepath.Join(o.out, "yara.tsv"))
 	if err != nil {
 		return err
 	}
-	defer f.Close()
 	w := bufio.NewWriter(f)
-	defer w.Flush()
+	defer func() { resultErr = errors.Join(resultErr, finishReport(w, f)) }()
 	fmt.Fprintln(w, "rule\tsize\tpath")
 	count := map[string]int{}
 	for _, h := range hits {

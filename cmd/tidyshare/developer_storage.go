@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -24,32 +25,26 @@ type discoveryReport struct {
 	Caches        []cacheTarget `json:"caches"`
 	GitTrees      []gitTree     `json:"git_trees"`
 	Warnings      []string      `json:"warnings"`
+	Policy        storagePolicy `json:"policy,omitempty"`
 }
 
 func discoverStorage(ctx context.Context, root, out string) (discoveryReport, error) {
+	return discoverStorageWithPolicy(ctx, root, out, storagePolicy{})
+}
+
+func discoverStorageWithPolicy(ctx context.Context, root, out string, policy storagePolicy) (discoveryReport, error) {
 	report := discoveryReport{SchemaVersion: 1, Operation: "discover", Root: root, Caches: []cacheTarget{}, GitTrees: []gitTree{}, Warnings: []string{}}
+	report.Policy = policy
 	trees := map[string]gitTree{}
-	warn := func(path string, err error) {
-		if len(report.Warnings) < 1000 {
-			report.Warnings = append(report.Warnings, path+": "+err.Error())
-		} else if len(report.Warnings) == 1000 {
-			report.Warnings = append(report.Warnings, "additional discovery warnings omitted")
-		}
-	}
-	inspectGit := func(path string) bool {
-		found, err := gitTreesAt(ctx, path, root)
-		if err != nil {
-			warn(path, err)
-			return false
-		}
-		bare := false
-		for _, tree := range found {
-			trees[tree.Path] = tree
-			bare = bare || (tree.Path == path && tree.Kind == "bare")
-		}
-		return bare
-	}
+	warn := func(path string, err error) { discoveryWarning(&report, path, err) }
+	inspectGit := func(path string) bool { return discoverGitTrees(ctx, path, root, trees, warn) }
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if policy.excludes(path) {
+			if entry != nil && entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -57,31 +52,7 @@ func discoverStorage(ctx context.Context, root, out string) (discoveryReport, er
 			warn(path, walkErr)
 			return nil
 		}
-		if !entry.IsDir() {
-			if entry.Type().IsRegular() && (entry.Name() == ".git" || entry.Name() == "HEAD") {
-				if inspectGit(filepath.Dir(path)) && entry.Name() == "HEAD" {
-					return fs.SkipDir
-				}
-			}
-			return nil
-		}
-		if path == out {
-			return fs.SkipDir
-		}
-		if entry.Name() == ".git" && path != root {
-			inspectGit(filepath.Dir(path))
-			return fs.SkipDir
-		}
-		cache, err := cacheTargetAt(ctx, path)
-		if err != nil {
-			warn(path, err)
-			return fs.SkipDir
-		}
-		if cache != nil {
-			report.Caches = append(report.Caches, *cache)
-			return fs.SkipDir
-		}
-		return nil
+		return discoverStorageEntry(ctx, path, out, entry, policy, &report, inspectGit)
 	})
 	for _, tree := range trees {
 		report.GitTrees = append(report.GitTrees, tree)
@@ -92,6 +63,7 @@ func discoverStorage(ctx context.Context, root, out string) (discoveryReport, er
 
 func runDiscover(args []string) int {
 	flags := flag.NewFlagSet("discover", flag.ContinueOnError)
+	profile, protected := policyFlags(flags)
 	root := flags.String("root", "", "directory to inspect for language caches and Git trees (required)")
 	out := flags.String("out", "", "new report directory (required)")
 	formatsValue := flags.String("formats", "json,jsonl,md", "comma-separated json,jsonl,md; cache-plan.json is always retained")
@@ -128,7 +100,11 @@ func runDiscover(args []string) int {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	report, walkErr := discoverStorage(ctx, *root, *out)
+	policy, err := newStoragePolicy(*profile, *protected)
+	if err != nil {
+		return fail(err)
+	}
+	report, walkErr := discoverStorageWithPolicy(ctx, *root, *out, policy)
 	if err := writeDiscoveryReports(*out, formats, report); err != nil {
 		return fail(errors.Join(walkErr, err))
 	}
@@ -143,7 +119,12 @@ func runDiscover(args []string) int {
 }
 
 func writeDiscoveryReports(out string, formats []string, report discoveryReport) error {
-	plan := cachePlan{SchemaVersion: 1, Root: report.Root, Targets: []cacheTarget{}}
+	for _, cache := range report.Caches {
+		if cacheWithin(cache.Path, out) {
+			return errors.New("reports must remain outside discovered caches")
+		}
+	}
+	plan := cachePlan{SchemaVersion: 2, Platform: runtime.GOOS, Policy: report.Policy, Root: report.Root, Targets: []cacheTarget{}}
 	for _, cache := range report.Caches {
 		if cache.Cleanup {
 			plan.Targets = append(plan.Targets, cache)
@@ -237,4 +218,61 @@ func encodeDiscoveryReport(w io.Writer, format string, report discoveryReport) e
 	default:
 		return errors.New("unsupported discovery report format")
 	}
+}
+
+func discoveryWarning(report *discoveryReport, path string, err error) {
+	if len(report.Warnings) < 1000 {
+		report.Warnings = append(report.Warnings, path+": "+err.Error())
+	} else if len(report.Warnings) == 1000 {
+		report.Warnings = append(report.Warnings, "additional discovery warnings omitted")
+	}
+}
+
+func discoverGitTrees(ctx context.Context, path, root string, trees map[string]gitTree, warn func(string, error)) bool {
+	found, err := gitTreesAt(ctx, path, root)
+	if err != nil {
+		warn(path, err)
+		return false
+	}
+	bare := false
+	for _, tree := range found {
+		trees[tree.Path] = tree
+		bare = bare || (tree.Path == path && tree.Kind == "bare")
+	}
+	return bare
+}
+
+func discoverStorageEntry(ctx context.Context, path, out string, entry fs.DirEntry, policy storagePolicy, report *discoveryReport, inspectGit func(string) bool) error {
+	if !entry.IsDir() {
+		return discoverStorageFile(path, entry, inspectGit)
+	}
+	if path == out || policy.excludes(path) {
+		return fs.SkipDir
+	}
+	if entry.Name() == ".git" && path != report.Root {
+		inspectGit(filepath.Dir(path))
+		return fs.SkipDir
+	}
+	cache, err := cacheTargetAt(ctx, path)
+	if err != nil {
+		discoveryWarning(report, path, err)
+		return fs.SkipDir
+	}
+	if cache != nil && policy.overlaps(path) {
+		return fs.SkipDir
+	}
+	if cache != nil {
+		report.Caches = append(report.Caches, *cache)
+		return fs.SkipDir
+	}
+	return nil
+}
+
+func discoverStorageFile(path string, entry fs.DirEntry, inspectGit func(string) bool) error {
+	if entry.Type().IsRegular() && (entry.Name() == ".git" || entry.Name() == "HEAD") {
+		if inspectGit(filepath.Dir(path)) && entry.Name() == "HEAD" {
+			return fs.SkipDir
+		}
+	}
+	return nil
 }

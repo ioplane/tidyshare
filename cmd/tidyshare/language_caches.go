@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -28,11 +29,18 @@ type cacheTarget struct {
 type cachePlan struct {
 	SchemaVersion int           `json:"schema_version"`
 	Root          string        `json:"root"`
+	Platform      string        `json:"platform,omitempty"`
+	Policy        storagePolicy `json:"policy,omitempty"`
 	Targets       []cacheTarget `json:"targets"`
 }
 
 var cacheLayouts = []struct{ suffix, kind string }{
 	{".cache/go-build", "go_build"},
+	{"Library/Caches/go-build", "go_build"},
+	{"Library/Caches/pip", "pip"},
+	{"Library/Caches/Homebrew", "homebrew"},
+	{"Library/Developer/Xcode/DerivedData", "xcode"},
+	{"Library/Caches/pnpm", "pnpm"},
 	{"go/pkg/mod", "go_modules"},
 	{".cache/pip", "pip"},
 	{".cache/uv", "uv"},
@@ -175,31 +183,52 @@ func cacheTargetAt(ctx context.Context, path string) (*cacheTarget, error) {
 	if err := unix.Fstat(int(f.Fd()), &st); err != nil {
 		return nil, err
 	}
-	bytes, files, err := cacheWalk(ctx, f, st.Dev, nil)
+	bytes, files, err := cacheWalk(ctx, f, uint64(st.Dev), nil)
 	if err != nil {
 		return nil, err
 	}
-	target := &cacheTarget{Kind: kind, Path: path, Bytes: bytes, Files: files, Device: st.Dev, Inode: st.Ino, UID: st.Uid, Cleanup: cacheCleanupSupported(kind)}
+	target := &cacheTarget{Kind: kind, Path: path, Bytes: bytes, Files: files, Device: uint64(st.Dev), Inode: st.Ino, UID: st.Uid, Cleanup: cacheCleanupSupported(kind)}
 	if kind == "yarn" || kind == "yarn_berry" {
 		target.Reason = "unsupported native cleanup: rc/plugins and executable selection require qualification"
 	}
 	if kind == "maven" {
 		target.Reason = "protected local repository may contain unpublished packages"
 	}
+	if !target.Cleanup && target.Reason == "" {
+		target.Reason = "native cleanup is not qualified for this cache on this platform"
+	}
 	return target, nil
 }
 
 func cacheCleanupSupported(kind string) bool {
-	return kind != "maven" && kind != "yarn" && kind != "yarn_berry"
+	if runtime.GOOS == "darwin" {
+		switch kind {
+		case "go_build", "go_modules", "pip", "uv", "npm", "pnpm":
+			return true
+		default:
+			return false
+		}
+	}
+	return kind != "homebrew" && kind != "xcode" && kind != "maven" && kind != "yarn" && kind != "yarn_berry"
 }
 
 func validateCachePlan(p cachePlan) error {
-	if p.SchemaVersion != 1 || !filepath.IsAbs(p.Root) || filepath.Clean(p.Root) != p.Root || p.Targets == nil {
+	if (p.SchemaVersion != 1 && p.SchemaVersion != 2) || !filepath.IsAbs(p.Root) || filepath.Clean(p.Root) != p.Root || p.Targets == nil {
 		return errors.New("invalid cache plan root or schema")
+	}
+	if p.SchemaVersion == 1 && runtime.GOOS != "linux" {
+		return errors.New("legacy cache plans require Linux; run discover again")
+	}
+	if p.SchemaVersion == 2 && p.Platform != runtime.GOOS {
+		return errors.New("cache plan platform differs; run discover again")
+	}
+	policy, err := newStoragePolicy(p.Policy.Profile, p.Policy.Protected)
+	if err != nil {
+		return err
 	}
 	paths := make([]string, len(p.Targets))
 	for i, t := range p.Targets {
-		if !cacheWithin(p.Root, t.Path) || cacheKind(t.Path, false) == "" || cacheKind(t.Path, false) != t.Kind || t.Inode == 0 || t.Bytes < 0 || t.Files < 0 || t.Cleanup != cacheCleanupSupported(t.Kind) {
+		if policy.overlaps(t.Path) || !cacheWithin(p.Root, t.Path) || cacheKind(t.Path, false) == "" || cacheKind(t.Path, false) != t.Kind || t.Inode == 0 || t.Bytes < 0 || t.Files < 0 || t.Cleanup != cacheCleanupSupported(t.Kind) {
 			return errors.New("invalid cache target qualification or identity")
 		}
 		paths[i] = t.Path
@@ -255,7 +284,7 @@ func cacheWalkDepth(ctx context.Context, dir *os.File, device uint64, visit func
 			if err := unix.Fstatat(int(dir.Fd()), entry.Name(), &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 				return bytes, files, err
 			}
-			if st.Dev != device {
+			if uint64(st.Dev) != device {
 				return bytes, files, errors.New("cache crosses a filesystem boundary")
 			}
 			switch st.Mode & unix.S_IFMT {

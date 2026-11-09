@@ -43,19 +43,28 @@ func openCleanupFile(r row) (*cleanupFile, error) {
 		_ = parent.Close()
 		return nil, errors.New("file changed, is not regular or has multiple links")
 	}
+	if err := platformDuplicateGuard(f); err != nil {
+		_ = f.Close()
+		_ = parent.Close()
+		return nil, err
+	}
 	return &cleanupFile{f, parent, st, filepath.Base(r.path)}, nil
 }
 
 func (f *cleanupFile) close() { _ = f.file.Close(); _ = f.parent.Close() }
 
 func (f *cleanupFile) stable() bool {
+	if platformDuplicateGuard(f.file) != nil {
+		return false
+	}
 	var st unix.Stat_t
 	if unix.Fstatat(int(f.parent.Fd()), f.name, &st, unix.AT_SYMLINK_NOFOLLOW) != nil {
 		return false
 	}
 	old := f.info.Sys().(*syscall.Stat_t)
-	return st.Dev == uint64(old.Dev) && st.Ino == old.Ino && st.Nlink == 1 && st.Size == old.Size &&
-		st.Mtim.Sec == old.Mtim.Sec && st.Mtim.Nsec == old.Mtim.Nsec && st.Ctim.Sec == old.Ctim.Sec && st.Ctim.Nsec == old.Ctim.Nsec
+	mt, ct := fileTimes(f.info)
+	return uint64(st.Dev) == uint64(old.Dev) && st.Ino == old.Ino && st.Nlink == 1 && st.Size == old.Size &&
+		st.Mtim == mt && st.Ctim == ct
 }
 
 func equalCleanupFiles(ctx context.Context, a, b *os.File) (bool, error) {
@@ -110,11 +119,11 @@ func deleteCleanupFile(ctx context.Context, keep, dup *cleanupFile) (bool, error
 	if !keep.stable() || !dup.stable() {
 		return false, errors.New("file identity changed before claim")
 	}
-	if err := unix.Renameat2(pfd, dup.name, fd, "duplicate", unix.RENAME_NOREPLACE); err != nil {
+	if err := renameNoReplace(pfd, dup.name, fd, "duplicate"); err != nil {
 		return false, err
 	}
 	restore := func(cause error) (bool, error) {
-		if err := unix.Renameat2(fd, "duplicate", pfd, dup.name, unix.RENAME_NOREPLACE); err != nil {
+		if err := renameNoReplace(fd, "duplicate", pfd, dup.name); err != nil {
 			return false, fmt.Errorf("%w; restore failed; retained file at %s: %w", cause, filepath.Join(dup.parent.Name(), name, "duplicate"), err)
 		}
 		return false, cause
@@ -124,7 +133,8 @@ func deleteCleanupFile(ctx context.Context, keep, dup *cleanupFile) (bool, error
 		return restore(err)
 	}
 	old := dup.info.Sys().(*syscall.Stat_t)
-	if claimed.Ino != old.Ino || claimed.Dev != uint64(old.Dev) || claimed.Nlink != 1 || claimed.Size != old.Size || claimed.Mtim.Sec != old.Mtim.Sec || claimed.Mtim.Nsec != old.Mtim.Nsec {
+	mt, _ := fileTimes(dup.info)
+	if claimed.Ino != old.Ino || uint64(claimed.Dev) != uint64(old.Dev) || claimed.Nlink != 1 || claimed.Size != old.Size || claimed.Mtim != mt {
 		return restore(errors.New("claimed file does not match reviewed duplicate"))
 	}
 	equal, err := equalCleanupFiles(ctx, keep.file, dup.file)
@@ -142,6 +152,9 @@ func deleteCleanupFile(ctx context.Context, keep, dup *cleanupFile) (bool, error
 		return restore(errors.New("duplicate changed during comparison"))
 	}
 	if err := ctx.Err(); err != nil {
+		return restore(err)
+	}
+	if err := platformDuplicateGuard(dup.file); err != nil {
 		return restore(err)
 	}
 	if err := unix.Unlinkat(fd, "duplicate", 0); err != nil {
@@ -208,6 +221,18 @@ func cleanupDuplicate(ctx context.Context, keeper, duplicate row, execute bool) 
 }
 
 func cleanupDuplicates(ctx context.Context, plan string, execute bool, limit int) (cleanupReport, error) {
+	report := cleanupReport{SchemaVersion: 1, Operation: "cleanup_duplicates", DryRun: !execute, Results: []cleanupResult{}}
+	if err := ctx.Err(); err != nil {
+		return report, err
+	}
+	groups, order, err := readDuplicatePlan(plan)
+	if err != nil {
+		return report, err
+	}
+	return cleanupDuplicateRows(ctx, groups, order, execute, limit, storagePolicy{})
+}
+
+func cleanupDuplicateRows(ctx context.Context, groups map[string][]row, order []string, execute bool, limit int, policy storagePolicy) (cleanupReport, error) {
 	r := cleanupReport{SchemaVersion: 1, Operation: "cleanup_duplicates", DryRun: !execute, Results: []cleanupResult{}}
 	if limit < 0 {
 		return r, errors.New("limit must be non-negative")
@@ -215,39 +240,15 @@ func cleanupDuplicates(ctx context.Context, plan string, execute bool, limit int
 	if err := ctx.Err(); err != nil {
 		return r, err
 	}
-	groups, order, err := readDuplicatePlan(plan)
-	if err != nil {
+	if err := validateDuplicateRowsPolicy(groups, policy); err != nil {
 		return r, err
 	}
 	for _, id := range order {
-		var keeper row
-		for _, v := range groups[id] {
-			if v.act == "keep" {
-				keeper = v
-			}
+		if err := cleanupDuplicateGroup(ctx, groups[id], execute, limit, &r); err != nil {
+			return r, err
 		}
-		for _, v := range groups[id] {
-			if v.act != "dup" {
-				continue
-			}
-			if limit > 0 && len(r.Results) >= limit {
-				return r, nil
-			}
-			if err := ctx.Err(); err != nil {
-				return r, err
-			}
-			result, err := cleanupDuplicate(ctx, keeper, v, execute)
-			r.Results = append(r.Results, result)
-			if result.Status == "deleted" {
-				r.Changed++
-				r.LogicalBytes += v.size
-			}
-			if result.Status == "skipped" || result.Status == "absent" {
-				r.Skipped++
-			}
-			if err != nil {
-				return r, err
-			}
+		if limit > 0 && len(r.Results) >= limit {
+			return r, nil
 		}
 	}
 	return r, nil
@@ -274,4 +275,52 @@ func readDuplicatePlan(path string) (map[string][]row, []string, error) {
 		return nil, nil, errors.New("duplicate plan must be a regular file no larger than 64 MiB")
 	}
 	return readPlan(f)
+}
+
+func validateDuplicateRowsPolicy(groups map[string][]row, policy storagePolicy) error {
+	for _, rows := range groups {
+		for _, item := range rows {
+			if policy.excludes(item.path) {
+				return errors.New("duplicate plan contains a protected path")
+			}
+		}
+	}
+	return nil
+}
+
+func cleanupDuplicateGroup(ctx context.Context, rows []row, execute bool, limit int, r *cleanupReport) error {
+	var keeper row
+	for _, v := range rows {
+		if v.act == "keep" {
+			keeper = v
+		}
+	}
+	for _, v := range rows {
+		if v.act != "dup" {
+			continue
+		}
+		if limit > 0 && len(r.Results) >= limit {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		result, err := cleanupDuplicate(ctx, keeper, v, execute)
+		recordDuplicateCleanupResult(r, result, v)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func recordDuplicateCleanupResult(r *cleanupReport, result cleanupResult, v row) {
+	r.Results = append(r.Results, result)
+	if result.Status == "deleted" {
+		r.Changed++
+		r.LogicalBytes += v.size
+	}
+	if result.Status == "skipped" || result.Status == "absent" {
+		r.Skipped++
+	}
 }

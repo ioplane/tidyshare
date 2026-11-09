@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -21,10 +22,7 @@ import (
 func TestMCPDeveloperStorage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	binary := filepath.Join(t.TempDir(), "tidyshare")
-	if output, err := exec.CommandContext(ctx, "go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v %s", err, output)
-	}
+	binary := tidyshareTestBinary(t)
 	for _, allow := range []bool{false, true} {
 		t.Run(map[bool]string{false: "dry-run-only", true: "explicit-execute"}[allow], func(t *testing.T) {
 			root, out := t.TempDir(), t.TempDir()
@@ -75,10 +73,10 @@ func TestMCPDeveloperStorage(t *testing.T) {
 				t.Fatalf("execution gate: allow=%t error=%t", allow, r.IsError)
 			}
 			_, statErr := os.Stat(payload)
-			if allow && !os.IsNotExist(statErr) {
+			if allow && runtime.GOOS == "linux" && !os.IsNotExist(statErr) {
 				t.Fatalf("payload remains after execute: %v", statErr)
 			}
-			if !allow && statErr != nil {
+			if (!allow || runtime.GOOS == "darwin") && statErr != nil {
 				t.Fatal("opt-in refusal removed payload", statErr)
 			}
 			if allow {
@@ -119,12 +117,12 @@ func TestMCPDeveloperStorage(t *testing.T) {
 }
 
 func TestMCPCacheCancellationStopsNativeDescendants(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("native cache execution is not qualified on Darwin; tested by Darwin guard fixtures")
+	}
 	ctx, stop := context.WithTimeout(context.Background(), 60*time.Second)
 	defer stop()
-	binary := filepath.Join(t.TempDir(), "tidyshare")
-	if output, err := exec.CommandContext(ctx, "go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v %s", err, output)
-	}
+	binary := tidyshareTestBinary(t)
 	p := cacheFixture(t, ".cache/pip", "http-v2/payload.body")
 	out := t.TempDir()
 	body, err := json.Marshal(p)

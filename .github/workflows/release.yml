@@ -20,13 +20,51 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Prepare one release identity
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      ldflags: ${{ steps.identity.outputs.ldflags }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.27.3
+      - name: Prepare version and linker inputs
+        id: identity
+        env:
+          TIDYSHARE_REF_TYPE: ${{ github.ref_type }}
+          TIDYSHARE_REF_NAME: ${{ github.ref_name }}
+          TIDYSHARE_SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TIDYSHARE_VERSION=$(GOTOOLCHAIN=local go run scripts/agent_bundle.go \
+            -ref-type "$TIDYSHARE_REF_TYPE" -ref "$TIDYSHARE_REF_NAME" \
+            -commit "$TIDYSHARE_SOURCE_COMMIT")
+          TIDYSHARE_LDFLAGS=$(GOTOOLCHAIN=local go run scripts/agent_bundle.go \
+            -print-ldflags -version "$TIDYSHARE_VERSION" -commit "$TIDYSHARE_SOURCE_COMMIT")
+          printf 'version=%s\n' "$TIDYSHARE_VERSION" >> "$GITHUB_OUTPUT"
+          printf 'ldflags=%s\n' "$TIDYSHARE_LDFLAGS" >> "$GITHUB_OUTPUT"
+
   release:
+    needs: [prepare, darwin]
     name: Build, attest, and publish
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       attestations: write
       contents: write
       id-token: write
+    env:
+      TIDYSHARE_RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      TIDYSHARE_LDFLAGS: ${{ needs.prepare.outputs.ldflags }}
+      TIDYSHARE_SOURCE_COMMIT: ${{ github.sha }}
     steps:
       - name: Harden runner
         uses: step-security/harden-runner@dc2769abcc0fcfbadfc1df54081c1608579ef6b2 # v2.22.2
@@ -110,16 +148,18 @@ jobs:
           if [[ "$PUBLISH" != true ]]; then
             args+=(--snapshot)
           fi
-          sudo --preserve-env=GORELEASER_CURRENT_TAG podman run --rm \
+          sudo --preserve-env=GORELEASER_CURRENT_TAG,TIDYSHARE_RELEASE_VERSION,TIDYSHARE_LDFLAGS,TIDYSHARE_SOURCE_COMMIT podman run --rm \
             --network none \
             --security-opt no-new-privileges=true \
             --volume "$PWD:/workspace:rw" \
             --volume "$RUNNER_TEMP/goreleaser:/tools:ro" \
             --workdir /workspace \
             --env GORELEASER_CURRENT_TAG \
+            --env TIDYSHARE_RELEASE_VERSION --env TIDYSHARE_LDFLAGS \
+            --env TIDYSHARE_SOURCE_COMMIT --env GOTOOLCHAIN=local \
             --env HOME=/tmp/home --env GOCACHE=/tmp/go-build \
             localhost/ioplane/tidyshare-dev:1.27.3 \
-            sh -ec '/tools/goreleaser check; exec /tools/goreleaser "$@"' sh "${args[@]}"
+            sh -ec 'go test scripts/agent_bundle.go scripts/agent_bundle_test.go; /tools/goreleaser check; /tools/goreleaser "$@"; go run scripts/agent_bundle.go -source agent-bundle -out .artifacts/release -version "$TIDYSHARE_RELEASE_VERSION" -commit "$TIDYSHARE_SOURCE_COMMIT"' sh "${args[@]}"
           sudo chown -R "$(id -u):$(id -g)" .artifacts
           jq -r '.[] | select(.type == "Binary" and .extra.Format == "binary") | [.path, .name] | @tsv' \
             .artifacts/release/artifacts.json |
@@ -127,6 +167,48 @@ jobs:
               cp -- "$source" ".artifacts/release/$name"
             done
           (cd .artifacts/release && sha256sum --check tidyshare_v*_checksums.txt)
+          sudo --preserve-env=TIDYSHARE_RELEASE_VERSION,TIDYSHARE_LDFLAGS,TIDYSHARE_SOURCE_COMMIT podman run --rm \
+            --network none --security-opt no-new-privileges=true \
+            --volume "$PWD:/workspace:rw" --workdir /workspace \
+            --env TIDYSHARE_RELEASE_VERSION --env TIDYSHARE_LDFLAGS \
+            --env TIDYSHARE_SOURCE_COMMIT --env GOTOOLCHAIN=local \
+            --env HOME=/tmp/home --env GOCACHE=/tmp/go-build \
+            localhost/ioplane/tidyshare-dev:1.27.3 sh -ec '
+              for arch in amd64 arm64; do
+                set --
+                if [ "$arch" = amd64 ]; then set -- -native; fi
+                go run scripts/agent_bundle.go \
+                  -record-binary ".artifacts/release/tidyshare_v${TIDYSHARE_RELEASE_VERSION}_linux_${arch}" \
+                  -receipt ".artifacts/release/binary-linux-${arch}.json" \
+                  -version "$TIDYSHARE_RELEASE_VERSION" -commit "$TIDYSHARE_SOURCE_COMMIT" \
+                  -build-ldflags "$TIDYSHARE_LDFLAGS" \
+                  -goreleaser-metadata .artifacts/release/metadata.json "$@"
+              done'
+          sudo chown -R "$(id -u):$(id -g)" .artifacts/release
+
+      - name: Download native Darwin binaries
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: darwin-*-${{ github.sha }}
+          merge-multiple: true
+          path: .artifacts/release
+
+      - name: Check all binary identities and the agent bundle
+        run: |
+          set -euo pipefail
+          cd .artifacts/release
+          TIDYSHARE_CHECKSUM=$(find . -maxdepth 1 -name 'tidyshare_v*_checksums.txt' -print)
+          [[ -n "$TIDYSHARE_CHECKSUM" && "$TIDYSHARE_CHECKSUM" != *$'\n'* ]]
+          sha256sum tidyshare_v*_linux_* tidyshare_v*_darwin_* tidyshare_v*_agent-bundle.tar.gz > "$TIDYSHARE_CHECKSUM"
+          sha256sum --check "$TIDYSHARE_CHECKSUM"
+          cd "$GITHUB_WORKSPACE"
+          sudo --preserve-env=TIDYSHARE_RELEASE_VERSION,TIDYSHARE_SOURCE_COMMIT podman run --rm \
+            --network none --security-opt no-new-privileges=true \
+            --volume "$PWD:/workspace:ro" --workdir /workspace \
+            --env TIDYSHARE_RELEASE_VERSION --env TIDYSHARE_SOURCE_COMMIT \
+            --env GOTOOLCHAIN=local --env HOME=/tmp/home --env GOCACHE=/tmp/go-build \
+            localhost/ioplane/tidyshare-dev:1.27.3 sh -ec \
+            'go run scripts/agent_bundle.go -verify-assets .artifacts/release -version "$TIDYSHARE_RELEASE_VERSION" -commit "$TIDYSHARE_SOURCE_COMMIT"'
 
       - name: Create draft and upload release assets
         if: ${{ steps.mode.outputs.publish == 'true' }}
@@ -155,6 +237,7 @@ jobs:
             .artifacts/release/tidyshare_v*
             .artifacts/release/metadata.json
             .artifacts/release/artifacts.json
+            .artifacts/release/binary-*.json
           retention-days: 14
           if-no-files-found: error
 
@@ -165,3 +248,60 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: >-
           gh release edit "$TAG" --draft=false
+
+  darwin:
+    needs: prepare
+    name: Darwin ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: amd64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      CGO_ENABLED: "1"
+      GOFLAGS: -tags=remote,exclude_graphdriver_btrfs,containers_image_openpgp
+      TMPDIR: /private/tmp
+      GOTOOLCHAIN: local
+      TIDYSHARE_RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      TIDYSHARE_LDFLAGS: ${{ needs.prepare.outputs.ldflags }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.27.3
+      - name: Verify native code
+        run: |
+          go vet ./...
+          go test -race -count=1 -shuffle=on -timeout=3m ./...
+      - name: Build native binary
+        env:
+          TIDYSHARE_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          TIDYSHARE_VERSION="v${TIDYSHARE_RELEASE_VERSION}"
+          mkdir -p .artifacts/darwin
+          TIDYSHARE_BINARY=".artifacts/darwin/tidyshare_${TIDYSHARE_VERSION}_darwin_${TIDYSHARE_ARCH}"
+          go build -trimpath -ldflags "$TIDYSHARE_LDFLAGS" -o "$TIDYSHARE_BINARY" ./cmd/tidyshare
+          go run scripts/agent_bundle.go -record-binary "$TIDYSHARE_BINARY" \
+            -receipt ".artifacts/darwin/binary-darwin-${TIDYSHARE_ARCH}.json" \
+            -version "$TIDYSHARE_RELEASE_VERSION" -commit "$GITHUB_SHA" \
+            -build-ldflags "$TIDYSHARE_LDFLAGS" -native
+          "$TIDYSHARE_BINARY" doctor -root "$RUNNER_TEMP" -json
+      - name: Upload native binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: darwin-${{ matrix.arch }}-${{ github.sha }}
+          path: |
+            .artifacts/darwin/tidyshare_*
+            .artifacts/darwin/binary-*.json
+          if-no-files-found: error

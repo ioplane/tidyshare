@@ -36,6 +36,14 @@ operations within configured filesystem and image-store boundaries.
 - **MCP** over local stdio, scoped to an explicit root and image store;
   deletion requires startup opt-in and an explicit tool request.
 
+## Workstation support
+
+The source tree adds native macOS scans, Git/cache inventory, quarantine,
+reviewed duplicate deletion and local Docker inventory. Darwin cache execution
+is not qualified because complete process visibility is not established.
+Published `v0.1.0` assets remain Linux-only.
+See [the workstation workflow](docs/en/howto/workstation.md).
+
 ## Install
 
 Download [v0.1.0](https://github.com/ioplane/tidyshare/releases/tag/v0.1.0),
@@ -57,6 +65,15 @@ and Actions snapshots. Or build this release from source with Go:
 ```bash
 CGO_ENABLED=0 go install -tags remote,exclude_graphdriver_btrfs,containers_image_openpgp github.com/ioplane/tidyshare/cmd/tidyshare@v0.1.0
 ```
+
+## Agent bundle
+
+The release pipeline builds a portable agent bundle beside the CLI binaries.
+Use a bundle and binary from the same version and source commit. Verify release
+checksums and attestations before use. Copy the whole extracted bundle into a
+client-specific skill directory. See [the bundle README](agent-bundle/README.md)
+for manual setup and workflow links. The bundle does not install itself or
+authorize cleanup. Published v0.1.0 assets do not include this bundle.
 
 ## Quick start
 
@@ -94,7 +111,8 @@ supported managers, protected storage and execution workflow.
 
 ## Requirements
 
-- Linux. `scan` also reads from any tree the user can read.
+- Linux, or a native macOS source build for the supported workstation operations.
+  Darwin cache execution remains unqualified. `scan` reads trees the user can read.
 - `apply -mode dedupe`: a filesystem with `FIDEDUPERANGE` support (XFS with
   `reflink=1`, Btrfs).
 - Optional: a running local Podman API service for image matching, `yara`
@@ -122,6 +140,7 @@ An image plan is not a backup; retain a verified recovery source before deletion
 | Clean language caches | [docs/en/howto/clean-language-caches.md](docs/en/howto/clean-language-caches.md) |
 | Reclaim space | [docs/en/howto/reclaim-space.md](docs/en/howto/reclaim-space.md) |
 | Clean orphan images | [docs/en/howto/clean-images.md](docs/en/howto/clean-images.md) |
+| Inspect a macOS workstation | [docs/en/howto/workstation.md](docs/en/howto/workstation.md) |
 | Use MCP | [docs/en/howto/use-mcp.md](docs/en/howto/use-mcp.md) |
 | Match container images | [docs/en/howto/match-container-images.md](docs/en/howto/match-container-images.md) |
 | Scan with YARA | [docs/en/howto/scan-with-yara.md](docs/en/howto/scan-with-yara.md) |

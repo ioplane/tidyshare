@@ -90,6 +90,7 @@ func cachePlanLocations(plan cachePlan, source, out string) error {
 
 func runCleanup(args []string) int {
 	f := flag.NewFlagSet("cleanup", flag.ContinueOnError)
+	profile, protected := policyFlags(f)
 	kind := f.String("kind", "", "duplicates, images or caches (required)")
 	plan := f.String("plan", "", "reviewed dups.tsv, image-plan.json or cache-plan.json (required)")
 	out := f.String("out", "", "new report directory (required)")
@@ -102,26 +103,32 @@ func runCleanup(args []string) int {
 		}
 		return fail(err)
 	}
-	if (*kind != "duplicates" && *kind != "images" && *kind != "caches") || *plan == "" || *out == "" || *limit < 0 || f.NArg() != 0 {
-		return fail(errors.New("-kind duplicates|images|caches, -plan and -out are required; limit must be non-negative; no positional arguments"))
+	formats, err := cleanupReportFormats(*kind, *plan, *out, *limit, f.NArg(), *format)
+	if err != nil {
+		return fail(err)
 	}
-	formats, err := parseReportFormats(*format)
+	policy, err := newStoragePolicy(*profile, *protected)
 	if err != nil {
 		return fail(err)
 	}
 	// Parse the entire input before reserving reports or making any deletion.
 	var imagePlan imageCleanupPlan
 	var caches cachePlan
+	var duplicateGroups map[string][]row
+	var duplicateOrder []string
 	switch *kind {
 	case "images":
 		imagePlan, err = readImagePlan(*plan)
 	case "caches":
 		caches, err = readCachePlan(*plan)
 		if err == nil {
-			err = cachePlanLocations(caches, *plan, *out)
+			err = validateCleanupCacheLocations(caches, policy, *plan, *out)
 		}
 	default:
-		_, _, err = readDuplicatePlan(*plan)
+		duplicateGroups, duplicateOrder, err = readDuplicatePlan(*plan)
+		if err == nil {
+			err = validateCleanupDuplicatePolicy(duplicateGroups, policy)
+		}
 	}
 	if err != nil {
 		return fail(err)
@@ -140,7 +147,7 @@ func runCleanup(args []string) int {
 	case "caches":
 		report, err = cleanupCaches(ctx, caches, *execute, *limit)
 	default:
-		report, err = cleanupDuplicates(ctx, *plan, *execute, *limit)
+		report, err = cleanupDuplicateRows(ctx, duplicateGroups, duplicateOrder, *execute, *limit, policy)
 	}
 	reportErr := finish(report)
 	if err := errors.Join(err, reportErr); err != nil {
@@ -202,4 +209,35 @@ func runImagePlan(args []string) int {
 	}
 	fmt.Fprintf(os.Stderr, "image cleanup plan in %s/image-plan.json\n", *out)
 	return 0
+}
+
+func validateCleanupCacheLocations(plan cachePlan, policy storagePolicy, source, out string) error {
+	for _, target := range plan.Targets {
+		if policy.overlaps(target.Path) {
+			return errors.New("cache target overlaps a protected root")
+		}
+	}
+	return cachePlanLocations(plan, source, out)
+}
+
+func validateCleanupDuplicatePolicy(groups map[string][]row, policy storagePolicy) error {
+	for _, rows := range groups {
+		for _, r := range rows {
+			if policy.excludes(r.path) {
+				return errors.New("duplicate target is protected")
+			}
+		}
+	}
+	return nil
+}
+
+func cleanupReportFormats(kind, plan, out string, limit, narg int, format string) ([]string, error) {
+	if (kind != "duplicates" && kind != "images" && kind != "caches") || plan == "" || out == "" || limit < 0 || narg != 0 {
+		return nil, errors.New("-kind duplicates|images|caches, -plan and -out are required; limit must be non-negative; no positional arguments")
+	}
+	formats, err := parseReportFormats(format)
+	if err != nil {
+		return nil, err
+	}
+	return formats, nil
 }

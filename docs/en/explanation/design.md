@@ -111,4 +111,6 @@ garbage: tier 3 lists it for visibility only.
   establish that an unmatched archive is absent.
 - Apply requires reviewed, quiet files and parent directories; a scan is not
   a filesystem snapshot or a lock against concurrent writers.
-- Windows and macOS are not supported.
+- Windows is not supported. Native macOS supports the workstation operations
+  described in [the workstation workflow](../howto/workstation.md). Darwin cache
+  execution remains unqualified. Docker inventory does not permit deletion.

@@ -4,6 +4,7 @@ name: tidyshare
 x-verification-service: &verification-service
   image: localhost/ioplane/tidyshare-dev:1.27.3
   working_dir: /workspace
+  init: true
   read_only: true
   network_mode: none
   security_opt:
@@ -13,20 +14,22 @@ x-verification-service: &verification-service
     HOME: /tmp/home
     XDG_CACHE_HOME: /tmp/cache
   tmpfs:
-    - /tmp:rw,nosuid,nodev,size=2g
+    - /tmp:rw,exec,nosuid,nodev,size=2g
   volumes:
     - .:/workspace:ro
 
 services:
   format:
     <<: *verification-service
+    # Formatting rewrites bind-mounted source files.
+    user: "0:0"
     volumes:
       - .:/workspace:rw
     command: ["gofumpt", "-w", "."]
 
   fmtcheck:
     <<: *verification-service
-    command: ["sh", "-c", "test -z \"$(gofumpt -l .)\""]
+    command: ["sh", "-c", "gofumpt -l . > /tmp/tidyshare-unformatted && test ! -s /tmp/tidyshare-unformatted"]
 
   modcheck:
     <<: *verification-service

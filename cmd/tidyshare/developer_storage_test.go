@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -15,10 +16,7 @@ import (
 func TestDeveloperStorageCLI(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	binary := filepath.Join(t.TempDir(), "tidyshare")
-	if output, err := exec.CommandContext(ctx, "go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v %s", err, output)
-	}
+	binary := tidyshareTestBinary(t)
 	root, out := t.TempDir(), t.TempDir()
 	cache := filepath.Join(root, "home", "dev", ".cache", "go-build")
 	payload := filepath.Join(cache, "00", strings.Repeat("0", 64)+"-d")
@@ -40,25 +38,7 @@ func TestDeveloperStorageCLI(t *testing.T) {
 		}
 	}
 	call("discover", "-root", root, "-out", out, "-formats", "json,jsonl,md")
-	var inventory struct {
-		Caches []struct {
-			Path    string `json:"path"`
-			Cleanup bool   `json:"cleanup"`
-		} `json:"caches"`
-		GitTrees []struct {
-			Path string `json:"path"`
-		} `json:"git_trees"`
-	}
-	body, err := os.ReadFile(filepath.Join(out, "discovery.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(body, &inventory); err != nil {
-		t.Fatal(err)
-	}
-	if len(inventory.Caches) != 2 || len(inventory.GitTrees) != 1 || inventory.GitTrees[0].Path != gitRoot {
-		t.Fatalf("wrong inventory: %s", body)
-	}
+	checkDeveloperDiscoveryReport(t, out, gitRoot)
 	plan := filepath.Join(out, "cache-plan.json")
 	for _, name := range []string{"discovery.jsonl", "discovery.md", "cache-plan.json"} {
 		if _, err := os.Stat(filepath.Join(out, name)); err != nil {
@@ -72,34 +52,8 @@ func TestDeveloperStorageCLI(t *testing.T) {
 	if _, err := os.Stat(payload); err != nil {
 		t.Fatal("report preflight modified cache", err)
 	}
-	for _, step := range []struct {
-		name    string
-		execute bool
-		changed int
-	}{{"dry", false, 0}, {"execute", true, 1}, {"repeat", true, 0}} {
-		output := filepath.Join(t.TempDir(), step.name)
-		args := []string{"cleanup", "-kind", "caches", "-plan", plan, "-out", output, "-formats", "json,jsonl,md"}
-		if step.execute {
-			args = append(args, "-yes")
-		}
-		call(args...)
-		body, err := os.ReadFile(filepath.Join(output, "cleanup.json"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		var report struct {
-			Changed int `json:"changed"`
-		}
-		if err := json.Unmarshal(body, &report); err != nil || report.Changed != step.changed {
-			t.Fatalf("%s changed=%d want=%d err=%v report=%s", step.name, report.Changed, step.changed, err, body)
-		}
-		if !step.execute {
-			if _, err := os.Stat(payload); err != nil {
-				t.Fatal("dry run lost payload", err)
-			}
-		}
-	}
-	if _, err := os.Stat(payload); !os.IsNotExist(err) {
+	checkDeveloperCleanupSteps(t, plan, payload, call)
+	if _, err := os.Stat(payload); runtime.GOOS == "linux" && !os.IsNotExist(err) {
 		t.Fatalf("payload remains: %v", err)
 	}
 	if b, err := os.ReadFile(localArtifact); err != nil || string(b) != "unpublished-local-package" {
@@ -134,5 +88,63 @@ func TestDiscoveryRefusesReportsInsideCache(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(p.Targets[0].Path, "index/payload.crate")); err != nil {
 		t.Fatal("discovery changed cache payload", err)
+	}
+}
+
+func checkDeveloperCleanupSteps(t *testing.T, plan, payload string, call func(...string)) {
+	t.Helper()
+	for _, step := range []struct {
+		name    string
+		execute bool
+		changed int
+	}{{"dry", false, 0}, {"execute", true, 1}, {"repeat", true, 0}} {
+		output := filepath.Join(t.TempDir(), step.name)
+		args := []string{"cleanup", "-kind", "caches", "-plan", plan, "-out", output, "-formats", "json,jsonl,md"}
+		if step.execute {
+			args = append(args, "-yes")
+		}
+		call(args...)
+		body, err := os.ReadFile(filepath.Join(output, "cleanup.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var report struct {
+			Changed int `json:"changed"`
+		}
+		wantChanged := step.changed
+		if runtime.GOOS == "darwin" {
+			wantChanged = 0
+		}
+		if err := json.Unmarshal(body, &report); err != nil || report.Changed != wantChanged {
+			t.Fatalf("%s changed=%d want=%d err=%v report=%s", step.name, report.Changed, step.changed, err, body)
+		}
+		if !step.execute {
+			if _, err := os.Stat(payload); err != nil {
+				t.Fatal("dry run lost payload", err)
+			}
+		}
+	}
+}
+
+func checkDeveloperDiscoveryReport(t *testing.T, out, gitRoot string) {
+	t.Helper()
+	var inventory struct {
+		Caches []struct {
+			Path    string `json:"path"`
+			Cleanup bool   `json:"cleanup"`
+		} `json:"caches"`
+		GitTrees []struct {
+			Path string `json:"path"`
+		} `json:"git_trees"`
+	}
+	body, err := os.ReadFile(filepath.Join(out, "discovery.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(body, &inventory); err != nil {
+		t.Fatal(err)
+	}
+	if len(inventory.Caches) != 2 || len(inventory.GitTrees) != 1 || inventory.GitTrees[0].Path != gitRoot {
+		t.Fatalf("wrong inventory: %s", body)
 	}
 }

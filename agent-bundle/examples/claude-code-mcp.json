@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tidyshare": {
+      "command": "/absolute/path/to/tidyshare",
+      "args": ["mcp", "-root", "/absolute/data/root", "-out", "/absolute/private/report-parent"]
+    }
+  }
+}

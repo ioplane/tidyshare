@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -64,11 +65,7 @@ func TestMCPBoundaries(t *testing.T) {
 func TestMCPStdioIntegration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	binary := filepath.Join(t.TempDir(), "tidyshare")
-	build := exec.CommandContext(ctx, "go", "build", "-o", binary, ".")
-	if output, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("build: %v %s", err, output)
-	}
+	binary := tidyshareTestBinary(t)
 	for _, allow := range []bool{false, true} {
 		t.Run(map[bool]string{false: "dry-run-only", true: "cleanup-enabled"}[allow], func(t *testing.T) {
 			root, out := t.TempDir(), t.TempDir()
@@ -90,7 +87,7 @@ func TestMCPStdioIntegration(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(tools.Tools) != 6 {
+			if len(tools.Tools) != 10 {
 				t.Fatalf("tools = %d", len(tools.Tools))
 			}
 			for _, tool := range tools.Tools {
@@ -106,7 +103,15 @@ func TestMCPStdioIntegration(t *testing.T) {
 				}
 				return result
 			}
-			scan := call("scan", map[string]any{"min_size": 1, "formats": "json,md"})
+			inventory := call("inventory_workstation", map[string]any{})
+			if inventory.IsError {
+				t.Fatalf("workstation inventory failed: %+v", inventory)
+			}
+			managed := call("plan_managed_cleanup", map[string]any{"kinds": []string{"homebrew"}})
+			if managed.IsError {
+				t.Fatalf("managed planning failed: %+v", managed)
+			}
+			scan := call("scan", map[string]any{"min_size": 1, "formats": " json,md,json "})
 			if scan.IsError {
 				t.Fatalf("scan failed: %+v", scan)
 			}
@@ -272,7 +277,11 @@ func TestMCPStdioIntegration(t *testing.T) {
 			}
 			<-ctx.Done()
 		}()
-		operations, err := newMCPOperations(mcpOptions{root: root, out: out, imageOwner: "root", imageSocket: "unix://" + socket})
+		currentUser, err := user.Current()
+		if err != nil {
+			t.Fatal(err)
+		}
+		operations, err := newMCPOperations(mcpOptions{root: root, out: out, imageOwner: currentUser.Username, imageSocket: "unix://" + socket})
 		if err != nil {
 			t.Fatal(err)
 		}
